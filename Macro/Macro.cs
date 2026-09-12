@@ -1,4 +1,12 @@
-﻿using System;
+﻿// ─────────────────────────────────────────────────────────────
+// Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
+// 适配游戏 r150：
+//  - player.Hit(false) → player.Hit(null, false)（r150 新增 long? hitTick）
+//  - 不兼容当前编译器的集合表达式 [with(n)] → new(n)
+//  - 手法模拟构建新增逐层 floor.speed 数组并传入原生层
+//  - 段边界仅在有效键位配置变化时重置手序（修复起始手连按两次）
+// ─────────────────────────────────────────────────────────────
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
@@ -65,10 +73,11 @@ namespace ADOFAIMacro.Macro
         private static int _hitEventPoolUsed;
 
         // 复用缓冲区
-        private static readonly List<double> _evTimeRecycle = [with(4096)];
-        private static readonly List<int> _evPressRecycle = [with(4096)];
-        private static readonly List<int> _evFloorRecycle = [with(4096)];
-        private static readonly List<PieceInfo> _piecesRecycle = [with(1024)];
+        private static readonly List<double> _evTimeRecycle = new(4096);
+        private static readonly List<int> _evPressRecycle = new(4096);
+        private static readonly List<int> _evFloorRecycle = new(4096);
+        private static readonly List<double> _evSpeedRecycle = new(4096);
+        private static readonly List<PieceInfo> _piecesRecycle = new(1024);
 
         // ─────────────────────────────────────────────
         //  时间锚点（双缓冲）
@@ -424,7 +433,7 @@ namespace ADOFAIMacro.Macro
             if (!Main.Settings.BlockInputWhenUnfocused || IsGameWindowFocused())
             {
                 int hitCount = Interlocked.Exchange(ref _workerNeedsHit, 0);
-                for (int h = 0; h < hitCount; h++) controller.chosenPlanet.player!.Hit(false);
+                for (int h = 0; h < hitCount; h++) controller.chosenPlanet.player!.Hit(null, false);
             }
 
             // 方案8：游玩期 GC 抑制（每次进关尝试，失败自动回退）
@@ -1158,10 +1167,12 @@ namespace ADOFAIMacro.Macro
             _evTimeRecycle.Clear();
             _evPressRecycle.Clear();
             _evFloorRecycle.Clear();
+            _evSpeedRecycle.Clear();
 
             var evTime = _evTimeRecycle;
             var evPress = _evPressRecycle;
             var evFloor = _evFloorRecycle;
+            var evSpeed = _evSpeedRecycle;
 
             for (int i = 0; i < floors.Length - 1; i++)
             {
@@ -1174,7 +1185,7 @@ namespace ADOFAIMacro.Macro
 
                 if (sim && fl.holdLength > -1 && nf != null && nf.holdLength == -1)
                 {
-                    evTime.Add(t); evPress.Add(-1); evFloor.Add(i);
+                    evTime.Add(t); evPress.Add(-1); evFloor.Add(i); evSpeed.Add(fl.speed);
                     continue;
                 }
 
@@ -1182,6 +1193,7 @@ namespace ADOFAIMacro.Macro
                 evTime.Add(t);
                 evPress.Add(isHoldHead ? 2 : 1);
                 evFloor.Add(i);
+                evSpeed.Add(fl.speed);
             }
 
             int total = evTime.Count;
@@ -1223,7 +1235,7 @@ namespace ADOFAIMacro.Macro
                         segments);
 
                     if (TechniqueSimulator.BuildHitEvents(
-                            [.. evTime], [.. evPress], [.. evFloor],
+                            [.. evTime], [.. evPress], [.. evFloor], [.. evSpeed],
                             total,
                             conductor!.bpm, ADOBase.controller.playerOne.planetarySystem.speed,
                             out var nativeEvents))
@@ -1325,6 +1337,15 @@ namespace ADOFAIMacro.Macro
             return -1;
         }
 
+        // 键位数组内容比较（分段键位覆盖变化判定用）
+        private static bool SameKeys(byte[]? a, byte[]? b)
+        {
+            if (ReferenceEquals(a, b)) return true;
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static void BuildPieces(
             List<double> evTime, List<int> evPress, List<int> evFloor,
@@ -1344,21 +1365,32 @@ namespace ADOFAIMacro.Macro
             float  lastSegLimit = GetSegmentBpmLimit(evFloor[0]);
             double nowBpm       = GetAdviceBpm(lastSegLimit);
             int    lastSegIdx   = FindSegmentIndex(evFloor[0]);
+            EffectiveTechConfig prevEc = GetEffectiveConfig(evFloor[0]);
 
             while (nowD < total)
             {
                 int   curFloorIdx = evFloor[nowD];
                 int   curSegIdx   = FindSegmentIndex(curFloorIdx);
                 float curSegLimit = GetSegmentBpmLimit(curFloorIdx);
+                var   ec          = GetEffectiveConfig(curFloorIdx);
 
+                // 段边界：仅当有效键位配置变化时才重置连续状态（手交替·倍乘·回溯）。
+                // 只改 BPM 阈值的分段不应打断手序（历史 bug：残留的 [0,0] 空分段
+                // 会在第 2 个事件处触发重置，导致起始手连按两次）。
                 if (curSegIdx != lastSegIdx)
                 {
-                    cHand   = (_levelTechHandPref == 0) ? -1 : 1;
-                    mult    = 0;
-                    Array.Clear(mCnt,    0, mCnt.Length);
-                    Array.Clear(mCntPre, 0, mCntPre.Length);
-                    canMulti  = 0;
-                    needBack  = false;
+                    bool keysChanged = !SameKeys(ec.LeftKeys, prevEc.LeftKeys)
+                                    || !SameKeys(ec.RightKeys, prevEc.RightKeys);
+                    if (keysChanged)
+                    {
+                        cHand   = (_levelTechHandPref == 0) ? -1 : 1;
+                        mult    = 0;
+                        Array.Clear(mCnt,    0, mCnt.Length);
+                        Array.Clear(mCntPre, 0, mCntPre.Length);
+                        canMulti  = 0;
+                        needBack  = false;
+                    }
+                    prevEc       = ec;
                     lastSegLimit = curSegLimit;
                     nowBpm       = GetAdviceBpm(curSegLimit);
                     lastSegIdx   = curSegIdx;
@@ -1372,8 +1404,6 @@ namespace ADOFAIMacro.Macro
                 int cnt   = CountEventsInRange(evTime, nowD, nowT + pLen * 0.995);
                 int csH   = (cHand == 1) ? 1 : 0;
 
-                // 使用分段有效配置来确定当前手的最大按键数
-                var   ec   = GetEffectiveConfig(curFloorIdx);
                 int   maxK = (csH == 0) ? ec.LeftKeys.Length : ec.RightKeys.Length;
 
                 int  mainHand  = (_levelTechHandPref == 0) ? -1 : 1;

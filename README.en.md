@@ -7,6 +7,16 @@
 
 [中文说明](README.md)
 
+> **Fork notice**: This repository is a fork of [adofaiex/ADOFAIMacro](https://github.com/adofaiex/ADOFAIMacro), maintained by [Daoguan-king](https://github.com/Daoguan-king). The upstream project is licensed under **AGPL-3.0** (plus a GPL-3.0 portion from AsyncInputOptimize); this fork keeps the same licenses, preserves all original copyright/license notices, and only contains compatibility and algorithm fixes. `Info.json` is left untouched.
+>
+> **Changes in this fork (2026-09, for game r150 / Unity 6.3)**
+> 1. **Game API compatibility**: `scrPlayer.Hit(bool)` → `Hit(long?, bool)`; `scrMisc.GetAdjustedAngleBoundaryInDeg` now takes `Difficulty` and returns a struct (probe uses `.Counted` and a Prefix captures the raw angle); `scrHitErrorMeter.AddHit` gained a `HitMargin` parameter and rewrites `angleDiff` in place; key filtering on `CountValidKeysPressed` became a transpiler (keeping the game's new touch/coop/key-limiter logic); replaced the unsupported `[with(n)]` syntax
+> 2. **Technique simulator rewrite**: continuous piece length `max(half-beat, 60/(2*limit))` removes the 2x jump at the BPM limit; boundary cutting scores by “distance − event gap” so doubles/chords stay on one hand and no phantom triples appear; per-floor `floor.speed` tracking; empty pieces no longer flip hands; segment reset only when the key config changes (fixes the starting hand repeating at the beginning)
+> 3. **Native layer**: new `BuildTechniqueHitEventsEx` export (legacy export kept); `InputSystem` / `TechniqueSimulator` rebuilt as Release|x64 (toolset v143)
+> 4. **Key overlay**: numpad `N0–N9 / N* N+ N- N. N/`, function/arrow keys, adaptive box width, `0xXX` fallback for unknown keys
+> 5. **Settings persistence**: speed-change tolerance is written back to the selected profile (fixes reset-to-0 after restart)
+> 6. **Docs**: README and EN/CN localization strings updated
+
 **ADOFAIMacro** is a UnityModManager mod for **A Dance of Fire and Ice (ADOFAI)**: it parses level floor timestamps and fires keys with microsecond-precision timing from a dedicated high-priority thread. From "direct judge triggering" to "system-level key simulation" to "two-hand technique simulation", it covers everything from fully automated clears to realistic hand-play styles.
 
 > ⚠️ **Two hard rules, up front:**

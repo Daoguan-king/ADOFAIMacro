@@ -1,3 +1,7 @@
+// ─────────────────────────────────────────────────────────────
+// Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
+// 新增 BuildTechniqueHitEventsEx 导出声明（逐事件速度倍率）
+// ─────────────────────────────────────────────────────────────
 #pragma once
 #include <windows.h>
 
@@ -93,6 +97,17 @@ extern "C" {
         double* entryTimes,
         int* pressTypes,
         int* floorIndices,
+        int     eventCount,
+        double  bpm,
+        double  speed,
+        int* outEventCount);
+
+    // 新版接口：逐事件速度倍率（scrFloor.speed，相对基准 BPM）
+    TECH_API HitEvent* BuildTechniqueHitEventsEx(
+        double* entryTimes,
+        int* pressTypes,
+        int* floorIndices,
+        double* speedMuls,
         int     eventCount,
         double  bpm,
         double  speed,

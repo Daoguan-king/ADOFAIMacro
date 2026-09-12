@@ -1,3 +1,13 @@
+// ─────────────────────────────────────────────────────────────
+// Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
+// 手法模拟分片算法重写：
+//  - 分片时长连续映射 max(半拍, 60/(2×阈值))，消除速率刚超过阈值时的 2 倍跳变
+//  - 切点改为“距标称片长距离 − 事件间隙”综合评分，吸附到事件边界：
+//    不再把手速双押/和弦拆到两只手，也不会与相邻单音并成三押
+//  - 逐事件局部速率（scrFloor.speed 倍率），变速谱不再网格失配
+//  - 空片不再切换手；段边界仅在有效键位配置变化时重置手序
+//  - 新增 BuildTechniqueHitEventsEx 导出（旧 BuildTechniqueHitEvents 保留兼容）
+// ─────────────────────────────────────────────────────────────
 #define TECHNIQUE_SIMULATOR_EXPORTS
 #include "TechniqueSimulator.h"
 #include <vector>
@@ -113,13 +123,19 @@ static int CountEventsInRange(const vector<double>& times, int start, double end
     return result - start;
 }
 
-// 将实际 BPM 折叠到 (limit/2, limit] 区间
-static double GetAdviceBpm(double bpm, double speed, double limit)
+// ─────────────────────────────────────────────
+//  分片基础时长
+//  连续映射：不短于“速度阈值”对应的最小交替周期（60/(2*limit)）。
+//  旧实现用八度折叠（rate 刚超过 limit 时片长 2 倍跳变），
+//  会导致铺面 BPM 略微超过阈值时手法突变，此处改为连续钳制。
+// ─────────────────────────────────────────────
+static double GetBasePieceLength(double bpm, double speed, double limit)
 {
-    double r = bpm * speed;
-    while (r > limit)      r /= 2.0;
-    while (r <= limit / 2.0) r *= 2.0;
-    return r;
+    double rate = bpm * speed;
+    if (rate < 1e-9) rate = 1e-9;
+    double halfBeat = 60.0 / (2.0 * rate);
+    double minPeriod = (limit > 1e-9) ? (60.0 / (2.0 * limit)) : 0.0;
+    return halfBeat > minPeriod ? halfBeat : minPeriod;
 }
 
 // 计算松键时刻偏移量
@@ -192,12 +208,16 @@ void SetTechniqueConfig(TechniqueConfig* config)
 }
 
 // ─────────────────────────────────────────────
-//  导出函数：BuildTechniqueHitEvents
+//  导出函数：BuildTechniqueHitEventsEx
+//
+//  speedMuls: 逐事件速度倍率（相对基准 BPM，来自 scrFloor.speed）；
+//             为 nullptr 时回退到全局 speed 参数（保持旧行为）。
 // ─────────────────────────────────────────────
-HitEvent* BuildTechniqueHitEvents(
+HitEvent* BuildTechniqueHitEventsEx(
     double* entryTimes,
     int* pressTypes,
     int* floorIndices,
+    double* speedMuls,
     int     eventCount,
     double  bpm,
     double  speed,
@@ -221,7 +241,7 @@ HitEvent* BuildTechniqueHitEvents(
             lastSegLimit = ec0.bpmLimit;
             lastSegIdx   = segIdx;     // 首次不触发边界重置
         }
-        double nowBpm = GetAdviceBpm(bpm, speed, lastSegLimit);
+        double baseLen = GetBasePieceLength(bpm, speedMuls ? speedMuls[0] : speed, lastSegLimit);
 
         double nowT = 0.0;
         int    nowD = 0;
@@ -231,6 +251,18 @@ HitEvent* BuildTechniqueHitEvents(
         long long mCntPre[16] = {};
         int  canMulti = 0;
         bool needBack = false;
+
+        // 段边界处用于比较“有效键位是否变化”
+        const unsigned char* prevLeftKeys = g_config.leftKeys;
+        int prevLeftKeyCount = g_config.leftKeyCount;
+        const unsigned char* prevRightKeys = g_config.rightKeys;
+        int prevRightKeyCount = g_config.rightKeyCount;
+        if (g_config.segmentCount > 0 && eventCount > 0) {
+            int segIdx0;
+            auto ecInit = ResolveConfig(evFloor[0], &segIdx0);
+            prevLeftKeys = ecInit.leftKeys;  prevLeftKeyCount = ecInit.leftKeyCount;
+            prevRightKeys = ecInit.rightKeys; prevRightKeyCount = ecInit.rightKeyCount;
+        }
 
         vector<PieceInfo> pieces;
         pieces.reserve(static_cast<std::vector<PieceInfo, std::allocator<PieceInfo>>::size_type>(eventCount / 4) + 4);
@@ -242,23 +274,36 @@ HitEvent* BuildTechniqueHitEvents(
             int curSegIdx;
             auto ec = ResolveConfig(evFloor[nowD], &curSegIdx);
 
-            // 段边界：重置所有连续状态（手交替·倍乘·回溯·BPM）
+            // 段边界：仅当有效键位配置变化时才重置连续状态（手交替·倍乘·回溯）。
+            // 只改 BPM 阈值的分段不应打断手序：历史 bug——配置档里残留的
+            // [0,0] 空分段会在第 2 个事件处触发重置，导致起始手连按两次。
             if (curSegIdx != lastSegIdx) {
-                hand = (g_config.handPreference == 0) ? -1 : 1;
-                mult = 0;
-                memset(mCnt, 0, sizeof(mCnt));
-                memset(mCntPre, 0, sizeof(mCntPre));
-                canMulti = 0;
-                needBack = false;
+                bool keysChanged =
+                    ec.leftKeys != prevLeftKeys || ec.leftKeyCount != prevLeftKeyCount ||
+                    ec.rightKeys != prevRightKeys || ec.rightKeyCount != prevRightKeyCount;
+                if (keysChanged) {
+                    hand = (g_config.handPreference == 0) ? -1 : 1;
+                    mult = 0;
+                    memset(mCnt, 0, sizeof(mCnt));
+                    memset(mCntPre, 0, sizeof(mCntPre));
+                    canMulti = 0;
+                    needBack = false;
+                }
+                prevLeftKeys = ec.leftKeys;   prevLeftKeyCount = ec.leftKeyCount;
+                prevRightKeys = ec.rightKeys; prevRightKeyCount = ec.rightKeyCount;
                 lastSegLimit = ec.bpmLimit;
-                nowBpm = GetAdviceBpm(bpm, speed, lastSegLimit);
                 lastSegIdx = curSegIdx;
             }
+
+            // 局部速率：逐事件速度倍率来自 scrFloor.speed（SetSpeed/BPM 事件已折算）。
+            // 连续钳制基础片长（见 GetBasePieceLength），避免阈值处手法突变。
+            double localSpeed = speedMuls ? speedMuls[nowD] : speed;
+            baseLen = GetBasePieceLength(bpm, localSpeed, lastSegLimit);
 
             // 防止死循环
             if (pieces.size() > (size_t)eventCount * 64) break;
 
-            double pLen = 60.0 / (nowBpm * pow(2.0, mult)) / 2.0;
+            double pLen = baseLen / pow(2.0, mult);
             if (pLen < 1e-9) pLen = 1e-9;
 
             int cnt = CountEventsInRange(evTime, nowD, nowT + pLen * 0.995);
@@ -289,39 +334,57 @@ HitEvent* BuildTechniqueHitEvents(
                 continue;
             }
 
-            /*
-            // ── 非二进制分片检测（三连音/五连音自适应）──
-            if (cnt > 0 && nowD + cnt < eventCount) {
-                double nextEvTime = evTime[nowD + cnt];
-                double boundary     = nowT + pLen;
-                double diff         = nextEvTime - boundary;
-                if (diff > pLen * 0.001 && diff < pLen * 0.50) {
-                    // 预测不调整时下一个分片的事件数
-                    // 注意 0.995 只乘在 pLen 上（与下次循环的计数范围一致）
-                    int nextCnt = CountEventsInRange(evTime, nowD + cnt, boundary + pLen * 0.995);
-                    // 只有当下一个分片不满（手分配不均）时才调整
-                    if (nextCnt < cnt) {
-                        pLen = nextEvTime - nowT;
-                    }
+            // ── 事件边界对齐（距离 + 间隙综合评分）───────────────
+            // 在标称片长对应的“事件数 ± 窗口”内选切点：
+            //   score = |切点时长 − 标称片长| − 切点间隙
+            // 纯“最大间隙”会把手速双押与相邻单音并成三押；
+            // 纯“最近距离”会把快双押/和弦从中间切开；加权兼顾两者。
+            // speedChangeTolerance 控制窗口宽度：0=仅邻近（按簇分组），
+            // 越大越倾向合并相邻簇成长连打（0.5 → 窗口 ±3）。
+            // 切点取“下一事件时刻”（cut-before），下一片直接从该事件起步。
+            double pieceLen = pLen;
+            if (cnt == 0) {
+                // 空片（长间隔）：延伸至下一事件前，且不切换手，
+                // 避免旧实现“每个空片翻一次手”导致的相位漂移。
+                double gapEnd = evTime[nowD];
+                if (gapEnd > nowT + 1e-12) {
+                    pieces.emplace_back(0, csH, gapEnd - nowT, nowT, gapEnd, nowD, mult);
+                    nowT = gapEnd;
+                    canMulti = 1;
+                    continue;
                 }
             }
-            */
-
-            // ── 自适应时间片延伸（仅在下一片更稀疏时合并）────
-            if (g_config.speedChangeTolerance > 0.0 && cnt > 0 && nowD + cnt < eventCount) {
-                double nextEvTime = evTime[nowD + cnt];
-                double diff = nextEvTime - (nowT + pLen);
-                if (diff > pLen * 0.001 && diff < pLen * g_config.speedChangeTolerance) {
-                    int nextCnt = CountEventsInRange(evTime, nowD + cnt, (nowT + pLen) + pLen * 0.995);
-                    if (nextCnt < cnt) {
-                        pLen = nextEvTime - nowT;
+            else {
+                int win = 1 + (int)(g_config.speedChangeTolerance * 4.0 + 0.5);
+                int lo = cnt - win; if (lo < 1) lo = 1;
+                int hi = cnt + win;
+                if (hi > maxK) hi = maxK;
+                if (hi > eventCount - nowD) hi = eventCount - nowD;
+                if (lo > hi) lo = hi;
+                int    bestK = lo;
+                double bestScore = 0.0, bestB = 0.0;
+                for (int k = lo; k <= hi; k++) {
+                    double gap, b;
+                    if (nowD + k < eventCount) {
+                        gap = evTime[nowD + k] - evTime[nowD + k - 1];
+                        b   = evTime[nowD + k];      // 切在下一事件之前
+                    } else {
+                        gap = (eventCount >= 2)
+                            ? (evTime[eventCount - 1] - evTime[eventCount - 2]) : pLen;
+                        b   = evTime[eventCount - 1] + gap;
+                    }
+                    double score = fabs((b - nowT) - pLen) - gap;
+                    if (k == lo || score < bestScore) {
+                        bestK = k; bestScore = score; bestB = b;
                     }
                 }
+                cnt = bestK;
+                pieceLen = bestB - nowT;
             }
 
             // 提交时间片
             memcpy(mCntPre, mCnt, sizeof(mCnt));
-            pieces.emplace_back(cnt, csH, pLen, nowT, nowT + pLen, nowD, mult);
+            pieces.emplace_back(cnt, csH, pieceLen, nowT, nowT + pieceLen, nowD, mult);
 
             // 更新级联倍乘计数器
             for (int c = mult; c > 0; c--) {
@@ -331,7 +394,7 @@ HitEvent* BuildTechniqueHitEvents(
             while (mult > 0 && mCnt[mult] == 0) mult--;
 
             nowD += cnt;
-            nowT += pLen;
+            nowT += pieceLen;
             hand = -hand;
             canMulti = 1;
 
@@ -500,6 +563,23 @@ HitEvent* BuildTechniqueHitEvents(
         *outEventCount = 0;
         return nullptr;
     }
+}
+
+// ─────────────────────────────────────────────
+//  导出函数：BuildTechniqueHitEvents（旧接口，兼容保留）
+// ─────────────────────────────────────────────
+HitEvent* BuildTechniqueHitEvents(
+    double* entryTimes,
+    int* pressTypes,
+    int* floorIndices,
+    int     eventCount,
+    double  bpm,
+    double  speed,
+    int* outEventCount)
+{
+    return BuildTechniqueHitEventsEx(
+        entryTimes, pressTypes, floorIndices, nullptr,
+        eventCount, bpm, speed, outEventCount);
 }
 
 // ─────────────────────────────────────────────

@@ -1,4 +1,10 @@
-﻿using System;
+﻿// ─────────────────────────────────────────────────────────────
+// Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
+// 适配游戏 r150：
+//  - 优先加载新的 BuildTechniqueHitEventsEx 导出（逐事件速度倍率），
+//    旧版 DLL 自动回退到 BuildTechniqueHitEvents
+// ─────────────────────────────────────────────────────────────
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -17,6 +23,7 @@ namespace ADOFAIMacro.Macro
         private static IntPtr _techDllHandle = IntPtr.Zero;
         private static DelegateSetTechConfig? _setTechConfig;
         private static DelegateBuildTechEvents? _buildTechEvents;
+        private static DelegateBuildTechEventsEx? _buildTechEventsEx;
         private static DelegateFreeTechEvents? _freeTechEvents;
         private static bool _dllLoadAttempted = false;
 
@@ -131,6 +138,17 @@ namespace ADOFAIMacro.Macro
             double bpm, double speed,
             out int outEventCount);
 
+        // 新版接口：逐事件速度倍率（scrFloor.speed，相对基准 BPM）
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr DelegateBuildTechEventsEx(
+            [In] double[] entryTimes,
+            [In] int[] pressTypes,
+            [In] int[] floorIndices,
+            [In] double[] speedMuls,
+            int eventCount,
+            double bpm, double speed,
+            out int outEventCount);
+
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void DelegateFreeTechEvents(IntPtr events);
 
@@ -201,10 +219,11 @@ namespace ADOFAIMacro.Macro
                 }
 
                 IntPtr setPtr = GetProcAddress(_techDllHandle, "SetTechniqueConfig");
+                IntPtr buildExPtr = GetProcAddress(_techDllHandle, "BuildTechniqueHitEventsEx");
                 IntPtr buildPtr = GetProcAddress(_techDllHandle, "BuildTechniqueHitEvents");
                 IntPtr freePtr = GetProcAddress(_techDllHandle, "FreeHitEvents");
 
-                if (setPtr == IntPtr.Zero || buildPtr == IntPtr.Zero || freePtr == IntPtr.Zero)
+                if (setPtr == IntPtr.Zero || (buildExPtr == IntPtr.Zero && buildPtr == IntPtr.Zero) || freePtr == IntPtr.Zero)
                 {
                     Macro.Log("[Macro] 获取函数地址失败");
                     FreeLibrary(_techDllHandle);
@@ -213,10 +232,15 @@ namespace ADOFAIMacro.Macro
                 }
 
                 _setTechConfig = Marshal.GetDelegateForFunctionPointer<DelegateSetTechConfig>(setPtr);
-                _buildTechEvents = Marshal.GetDelegateForFunctionPointer<DelegateBuildTechEvents>(buildPtr);
+                _buildTechEventsEx = buildExPtr != IntPtr.Zero
+                    ? Marshal.GetDelegateForFunctionPointer<DelegateBuildTechEventsEx>(buildExPtr)
+                    : null;
+                _buildTechEvents = buildPtr != IntPtr.Zero
+                    ? Marshal.GetDelegateForFunctionPointer<DelegateBuildTechEvents>(buildPtr)
+                    : null;
                 _freeTechEvents = Marshal.GetDelegateForFunctionPointer<DelegateFreeTechEvents>(freePtr);
 
-                Macro.Log("[Macro] 手法模拟DLL加载成功");
+                Macro.Log($"[Macro] 手法模拟DLL加载成功（接口: {(_buildTechEventsEx != null ? "Ex(per-floor speed)" : "Legacy")}）");
                 return true;
             }
             catch (Exception ex)
@@ -232,6 +256,7 @@ namespace ADOFAIMacro.Macro
             double[] entryTimes,
             int[] pressTypes,
             int[] floorIndices,
+            double[] speedMuls,
             int eventCount,
             double bpm, double speed,
             out Macro.HitEvent[]? hitEvents)
@@ -243,6 +268,11 @@ namespace ADOFAIMacro.Macro
                 Macro.Log("[Macro] 手法模拟配置未初始化");
                 return false;
             }
+            if (_buildTechEventsEx == null && _buildTechEvents == null)
+            {
+                Macro.Log("[Macro] 手法模拟DLL未加载");
+                return false;
+            }
 
             NativeTechniqueConfig config = default;
             IntPtr nativeEvents = IntPtr.Zero;
@@ -252,10 +282,21 @@ namespace ADOFAIMacro.Macro
                 config = PrepareNativeConfig();
                 _setTechConfig!(ref config);
 
-                nativeEvents = _buildTechEvents!(
-                    entryTimes, pressTypes, floorIndices,
-                    eventCount, bpm, speed,
-                    out int outCount);
+                int outCount;
+                if (_buildTechEventsEx != null)
+                {
+                    nativeEvents = _buildTechEventsEx(
+                        entryTimes, pressTypes, floorIndices, speedMuls,
+                        eventCount, bpm, speed,
+                        out outCount);
+                }
+                else
+                {
+                    nativeEvents = _buildTechEvents!(
+                        entryTimes, pressTypes, floorIndices,
+                        eventCount, bpm, speed,
+                        out outCount);
+                }
 
                 if (nativeEvents != IntPtr.Zero && outCount > 0)
                 {

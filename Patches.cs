@@ -1,4 +1,13 @@
-﻿using ADOFAIMacro.Macro;
+﻿// ─────────────────────────────────────────────────────────────
+// Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
+// 适配游戏 r150：
+//  - 判定探针改用 scrMisc.GetAdjustedAngleBoundaryInDeg(GCS.difficulty, …)
+//    并读取返回结构体的 .Counted；AddHit 会原地改写 angleDiff，
+//    改为在 Prefix 捕获原始弧度角
+//  - CountValidKeysPressed 由前缀整方法替换改为 Transpiler，
+//    保留游戏新增的触屏/合作/键位限制器逻辑
+// ─────────────────────────────────────────────────────────────
+using ADOFAIMacro.Macro;
 using ADOFAIMacro.Platform;
 using HarmonyLib;
 using SkyHook;
@@ -206,12 +215,22 @@ namespace ADOFAIMacro
         // ─────────────────────────────────────────────
         //  判定误差探针：用游戏自己的换算复现 AddHit 的毫秒误差，
         //  连同 speed 一起记录——用于定位变速段偏移（数据说话）
+        //  r150：AddHit 会把 angleDiff 参数原地转换为毫秒误差（starg），
+        //  Postfix 读到的是转换后的值；因此在 Prefix 捕获原始弧度角。
         // ─────────────────────────────────────────────
         [HarmonyPatch(typeof(scrHitErrorMeter), nameof(scrHitErrorMeter.AddHit))]
         public static class Patch_HitErrorMeter_AddHit
         {
+            [ThreadStatic] private static float _rawAngleDiff;
+
+            [HarmonyPrefix]
+            public static void Prefix(float angleDiff)
+            {
+                _rawAngleDiff = angleDiff;
+            }
+
             [HarmonyPostfix]
-            public static void Postfix(float angleDiff, float marginScale, scrPlanet planet, scrFloor hitFloor)
+            public static void Postfix(float marginScale, scrPlanet planet, scrFloor hitFloor)
             {
                 try
                 {
@@ -219,11 +238,13 @@ namespace ADOFAIMacro
                     if (conductor == null) return;
 
                     // 与游戏 AddHit 内部完全相同的换算
-                    float deg = angleDiff * -57.29578f;
+                    float deg = _rawAngleDiff * -57.29578f;
                     float? spd = (hitFloor ?? planet?.player?.currFloor?.prevfloor)?.speed;
                     double bpmTimesSpeed = conductor.bpm * (spd ?? 1f);
-                    double boundary = scrMisc.GetAdjustedAngleBoundaryInDeg(
-                        HitMarginGeneral.Counted, bpmTimesSpeed, conductor.song.pitch, marginScale);
+                    // r150：GetAdjustedAngleBoundaryInDeg 首参改为 Difficulty，返回结构体（Counted/Perfect/Pure/XPerfect）
+                    var boundaries = scrMisc.GetAdjustedAngleBoundaryInDeg(
+                        GCS.difficulty, bpmTimesSpeed, conductor.song.pitch, marginScale);
+                    double boundary = boundaries.Counted;
                     if (boundary <= 0) return;
                     float errMs = deg * (float)(60.0 / boundary);
 
@@ -409,56 +430,67 @@ namespace ADOFAIMacro
         }
 
         // 修改 CountValidKeysPressed 补丁添加黑白名单逻辑
+        // r150：游戏该方法在非 Switch / 非合作模式下直接读 RDInput.mainPressCount，
+        // 其余分支（触屏 / 合作 / 键位限制器）是新增逻辑。因此改为 Transpiler：
+        // 只把计数调用替换为过滤版，保留游戏自身的全部新逻辑。
         [HarmonyPatch(typeof(scrPlayer), "CountValidKeysPressed")]
         public static class scrPlayer_CountValidKeysPressed_Patch
         {
-            [HarmonyPrefix]
-            public static bool Prefix(ref int __result)
+            [HarmonyTranspiler]
+            public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
             {
-                __result = CountValidKeysPressed();
-                return false;
+                MethodInfo original = AccessTools.Method(typeof(RDInput), "get_mainPressCount");
+                MethodInfo replacement = AccessTools.Method(
+                    typeof(scrPlayer_CountValidKeysPressed_Patch), nameof(FilteredMainPressCount));
+                bool patched = false;
+
+                foreach (CodeInstruction ci in instructions)
+                {
+                    if (ci.opcode == OpCodes.Call && Equals(ci.operand, original))
+                    {
+                        patched = true;
+                        yield return new CodeInstruction(OpCodes.Call, replacement);
+                    }
+                    else
+                    {
+                        yield return ci;
+                    }
+                }
+
+                if (!patched)
+                    Main.Mod?.Logger.Warning("[KeyFilter] 未找到 RDInput.mainPressCount 调用点，按键过滤未生效");
             }
 
-            private static int CountValidKeysPressed()
+            private static int FilteredMainPressCount()
             {
-                int num = 0;
-                scrPlayer instance = ADOBase.controller?.chosenPlanet?.player;
-                instance.keyLimiterOverCounter = 0;
+                if (!Main.IsEnabled || !Main.Settings.Macro || !Main.Settings.EnableKeyFilter)
+                    return RDInput.mainPressCount;
 
+                int total = RDInput.mainPressCount;
+                int blocked = 0;
                 foreach (AnyKeyCode anyKeyCode in RDInput.GetMainPressKeys())
                 {
                     object value = anyKeyCode.value;
                     if (value is KeyCode keyCode)
                     {
-                        instance.keyFrequency[keyCode] = instance.keyFrequency.TryGetValue(keyCode, out int freq) ? freq + 1 : 0;
-                        instance.keyTotal++;
-
-                        // 黑白名单过滤
-                        if (IsKeyAllowed(keyCode))
+                        if (!IsKeyAllowed(keyCode))
                         {
-                            num++;
-                        }
-                        else
-                        {
+                            blocked++;
                             Macro.Macro.Log($"Filtered Key: {keyCode} ({(Main.Settings.FilterMode == 0 ? "Blacklist" : "Whitelist")})");
                         }
                     }
                     else if (value is AsyncKeyCode asyncKeyCode)
                     {
-                        instance.keyFrequency[asyncKeyCode] = instance.keyFrequency.TryGetValue(asyncKeyCode, out int asyncFreq) ? asyncFreq + 1 : 0;
-                        instance.keyTotal++;
-
-                        if (IsAsyncKeyAllowed(asyncKeyCode.key))  // 小写 key
+                        if (!IsAsyncKeyAllowed(asyncKeyCode.key))  // 小写 key
                         {
-                            num++;
-                        }
-                        else
-                        {
-                            Macro.Macro.Log($"Filtered Async Key in CountValidKeysPressed: {asyncKeyCode.key} (0x{asyncKeyCode.key:X2})");
+                            blocked++;
+                            Macro.Macro.Log($"Filtered Async Key in CountValidKeysPressed: {asyncKeyCode.key} (0x{asyncKeyCode.key:X2}) ({(Main.Settings.FilterMode == 0 ? "Blacklist" : "Whitelist")})");
                         }
                     }
                 }
-                return num;
+
+                int num = total - blocked;
+                return num < 0 ? 0 : num;
             }
         }
 

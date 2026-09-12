@@ -1,3 +1,8 @@
+// ─────────────────────────────────────────────────────────────
+// Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
+// 新增 GetDisplayText：内置按键显示覆盖层的 VK→短标签映射
+// （小键盘 N0–N9 / N* N+ N- N. N/、F1–F24、方向键、修饰键、标点等）
+// ─────────────────────────────────────────────────────────────
 using System.Collections.Generic;
 
 namespace ADOFAIMacro.Macro
@@ -68,5 +73,75 @@ namespace ADOFAIMacro.Macro
             ["LAUNCH_MAIL"] = 0xB4, ["LAUNCH_MEDIA_SELECT"] = 0xB5, ["LAUNCH_APP1"] = 0xB6,
             ["LAUNCH_APP2"] = 0xB7,
         };
+
+        /// <summary>
+        /// 虚拟键码 → 覆盖层按键显示的短标签（1~4 字符）。
+        /// 覆盖主键盘、小键盘、功能键与常用控制键；未知键返回 null（调用方自行兜底）。
+        /// </summary>
+        public static string GetDisplayText(byte vk)
+        {
+            // 主键盘数字 / 字母
+            if (vk >= 0x30 && vk <= 0x39) return ((char)vk).ToString();
+            if (vk >= 0x41 && vk <= 0x5A) return ((char)vk).ToString();
+
+            // 小键盘数字（VK_NUMPAD0..9）——加 N 前缀与主键盘数字区分
+            if (vk >= 0x60 && vk <= 0x69) return "N" + (char)('0' + vk - 0x60);
+
+            // 功能键 F1..F24
+            if (vk >= 0x70 && vk <= 0x87) return "F" + (vk - 0x6F);
+
+            switch (vk)
+            {
+                // 小键盘运算符（同样加 N 前缀）
+                case 0x6A: return "N*";
+                case 0x6B: return "N+";
+                case 0x6C: return "N,";
+                case 0x6D: return "N-";
+                case 0x6E: return "N.";
+                case 0x6F: return "N/";
+                // 编辑 / 控制
+                case 0x08: return "BS";
+                case 0x09: return "TAB";
+                case 0x0D: return "ENT";
+                case 0x13: return "PAU";
+                case 0x14: return "CAP";
+                case 0x1B: return "ESC";
+                case 0x20: return "SP";
+                case 0x21: return "PGU";
+                case 0x22: return "PGD";
+                case 0x23: return "END";
+                case 0x24: return "HOM";
+                case 0x25: return "←";
+                case 0x26: return "↑";
+                case 0x27: return "→";
+                case 0x28: return "↓";
+                case 0x2C: return "PRT";
+                case 0x2D: return "INS";
+                case 0x2E: return "DEL";
+                case 0x2F: return "HELP";
+                case 0x5B: return "WIN";
+                case 0x5C: return "WIN";
+                case 0x5D: return "MENU";
+                case 0x90: return "NUM";
+                case 0x91: return "SCR";
+                // 修饰键（通用 + 左右）
+                case 0x10: case 0xA0: case 0xA1: return "SHF";
+                case 0x11: case 0xA2: case 0xA3: return "CTL";
+                case 0x12: case 0xA4: case 0xA5: return "ALT";
+                // 标点（OEM 键）
+                case 0xBA: return ";";
+                case 0xBB: return "=";
+                case 0xBC: return ",";
+                case 0xBD: return "-";
+                case 0xBE: return ".";
+                case 0xBF: return "/";
+                case 0xC0: return "`";
+                case 0xDB: return "[";
+                case 0xDC: return "\\";
+                case 0xDD: return "]";
+                case 0xDE: return "'";
+            }
+            return null;
+        }
     }
 }

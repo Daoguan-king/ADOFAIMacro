@@ -1,4 +1,9 @@
-﻿using ADOFAIMacro.Macro;
+﻿// ─────────────────────────────────────────────────────────────
+// Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
+// 手法面板「变速容差」滑块即时写回当前配置档，
+// 修复重启后 SelectedTechniqueProfileIndex 加载档位时把该值覆盖为 0
+// ─────────────────────────────────────────────────────────────
+using ADOFAIMacro.Macro;
 using ADOFAIMacro.Localization;
 using HarmonyLib;
 using Newgrounds;
@@ -1226,11 +1231,22 @@ namespace ADOFAIMacro
 
             GUILayout.Space(4);
             GUILayout.BeginHorizontal();
-            SpeedChangeTolerance = UIUtils.M3HorizontalSliderWithLabelAndInput(
+            float newTol = UIUtils.M3HorizontalSliderWithLabelAndInput(
                 LocalizationManager.Get("tech.speed_change_tolerance"),
                 SpeedChangeTolerance, 0f, 0.5f,
                 ref _speedChangeToleranceState.input, ref _speedChangeToleranceState.focused,
                 "F2", 200, 240, 60);
+            if (newTol != SpeedChangeTolerance)
+            {
+                SpeedChangeTolerance = newTol;
+                // 立即同步到当前配置档：避免重启时 SelectedTechniqueProfileIndex 的
+                // setter 用档位旧值覆盖全局字段（曾导致“变速容差重启变 0”）。
+                if (_techniqueProfiles.Count > 0)
+                {
+                    int idx = Mathf.Clamp(SelectedTechniqueProfileIndex, 0, _techniqueProfiles.Count - 1);
+                    _techniqueProfiles[idx].speedChangeTolerance = newTol;
+                }
+            }
             GUILayout.EndHorizontal();
             GUILayout.Space(2);
             GUILayout.Label(LocalizationManager.Get("tech.speed_change_tolerance_desc"), tipStyle);
