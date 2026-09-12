@@ -1355,12 +1355,6 @@ namespace ADOFAIMacro.Macro
             int    nowD    = 0;
             var    _levelTechHandPref = LevelTechniqueManager.GetCurrentLevelConfig()?.handPreference ?? Main.Settings.TechniqueHandPreference;
             int    cHand   = (_levelTechHandPref == 0) ? -1 : 1;
-            int    mult    = 0;
-
-            var mCnt    = new long[16];
-            var mCntPre = new long[16];
-            int  canMulti  = 0;
-            bool needBack  = false;
 
             float  lastSegLimit = GetSegmentBpmLimit(evFloor[0]);
             double nowBpm       = GetAdviceBpm(lastSegLimit);
@@ -1374,7 +1368,7 @@ namespace ADOFAIMacro.Macro
                 float curSegLimit = GetSegmentBpmLimit(curFloorIdx);
                 var   ec          = GetEffectiveConfig(curFloorIdx);
 
-                // 段边界：仅当有效键位配置变化时才重置连续状态（手交替·倍乘·回溯）。
+                // 段边界：仅当有效键位配置变化时才重置连续状态（手交替）。
                 // 只改 BPM 阈值的分段不应打断手序（历史 bug：残留的 [0,0] 空分段
                 // 会在第 2 个事件处触发重置，导致起始手连按两次）。
                 if (curSegIdx != lastSegIdx)
@@ -1383,12 +1377,7 @@ namespace ADOFAIMacro.Macro
                                     || !SameKeys(ec.RightKeys, prevEc.RightKeys);
                     if (keysChanged)
                     {
-                        cHand   = (_levelTechHandPref == 0) ? -1 : 1;
-                        mult    = 0;
-                        Array.Clear(mCnt,    0, mCnt.Length);
-                        Array.Clear(mCntPre, 0, mCntPre.Length);
-                        canMulti  = 0;
-                        needBack  = false;
+                        cHand = (_levelTechHandPref == 0) ? -1 : 1;
                     }
                     prevEc       = ec;
                     lastSegLimit = curSegLimit;
@@ -1398,7 +1387,7 @@ namespace ADOFAIMacro.Macro
 
                 if (pieces.Count > total * 64) break;
 
-                double pLen = 60.0 / (nowBpm * Math.Pow(2, mult)) / 2.0;
+                double pLen = 60.0 / nowBpm / 2.0;
                 if (pLen < 1e-9) pLen = 1e-9;
 
                 int cnt   = CountEventsInRange(evTime, nowD, nowT + pLen * 0.995);
@@ -1406,29 +1395,12 @@ namespace ADOFAIMacro.Macro
 
                 int   maxK = (csH == 0) ? ec.LeftKeys.Length : ec.RightKeys.Length;
 
-                int  mainHand  = (_levelTechHandPref == 0) ? -1 : 1;
-                bool isOffHand = (cHand != mainHand);
-
+                // 密度超过单手指数：本片取满全部按键（maxK 个事件），
+                // 替代旧的 2 的幂细分（在极高 BPM 下会停在只用少数按键的尺寸）。
                 if (cnt > maxK)
                 {
-                    if (canMulti == 1 && isOffHand) needBack = true;
-                    if (mult < 7) { mult++; mCnt[mult] = 0; continue; }
-                    else           cnt = maxK;
-                }
-
-                if (needBack && pieces.Count > 0)
-                {
-                    needBack = false;
-                    cHand    = mainHand;
-                    var prev = pieces[pieces.Count - 1];
-                    nowT = prev.StartTime;
-                    nowD = prev.EvStart;
-                    Array.Copy(mCntPre, mCnt, 16);
-                    mult = prev.Multiplier + 1;
-                    if (mult > 7) mult = 7;
-                    pieces.RemoveAt(pieces.Count - 1);
-                    canMulti = 0;
-                    continue;
+                    cnt = maxK;
+                    if (nowD + maxK < total) pLen = evTime[nowD + maxK] - nowT;
                 }
 
                 // ── 自适应时间片延伸（仅在下一片更稀疏时合并）────
@@ -1448,20 +1420,11 @@ namespace ADOFAIMacro.Macro
                     }
                 }
 
-                Array.Copy(mCnt, mCntPre, 16);
-                pieces.Add(new PieceInfo(cnt, csH, pLen, nowT, nowT + pLen, nowD, mult));
-
-                for (int c = mult; c > 0; c--)
-                {
-                    mCnt[c] += (long)Math.Pow(2, 16 - (mult - c));
-                    mCnt[c] %= (1L << 18);
-                }
-                while (mult > 0 && mCnt[mult] == 0) mult--;
+                pieces.Add(new PieceInfo(cnt, csH, pLen, nowT, nowT + pLen, nowD));
 
                 nowD += cnt;
                 nowT += pLen;
                 cHand = -cHand;
-                canMulti = 1;
 
                 if (nowD < total && Math.Abs(evTime[nowD] - nowT) < pLen * 0.01)
                     nowT = evTime[nowD];

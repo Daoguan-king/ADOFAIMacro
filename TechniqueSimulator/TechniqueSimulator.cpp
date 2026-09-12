@@ -1,11 +1,22 @@
 // ─────────────────────────────────────────────────────────────
 // Fork 修改声明（Daoguan-king，2026-09；AGPL-3.0 §5a）
 // 手法模拟分片算法重写：
-//  - 分片时长连续映射 max(半拍, 60/(2×阈值))，消除速率刚超过阈值时的 2 倍跳变
-//  - 切点改为“距标称片长距离 − 事件间隙”综合评分，吸附到事件边界：
-//    不再把手速双押/和弦拆到两只手，也不会与相邻单音并成三押
-//  - 逐事件局部速率（scrFloor.speed 倍率），变速谱不再网格失配
+//  - 分片时长量化到局部半拍：超过阈值时取 h·round(rate/limit)，
+//    既避免八度折叠在阈值处的 2 倍跳变，又保持与谱面节拍网格对齐
+//    （修复 SetSpeed 提速后片长失配、被切成 3-1-1 碎块的问题）
+//  - 切点改为“距标称片长距离（欠长加倍）− 事件间隙”综合评分，
+//    吸附到事件边界：不再把手速双押/和弦拆到两只手，也不会把
+//    可合并的连打簇提前换手（旧实现偶发 3-1-1）
+//  - 逐事件局部速率（scrFloor.speed 倍率），取“下一事件”所属层速率：
+//    事件 i→i+1 的间隔由第 i+1 层速度决定，变速段首片不再沿用旧速率
+//  - 慢速段（速率未超阈值）片长不超过到下一事件的间隔（下限阈值半拍）：
+//    低 BPM 下更细网格的慢音符（45° 砖等）不再被并进同一只手
+//  - 换手仅在“实际音符速率”（按事件间隔折算，音符/分钟；90° 砖是砖 BPM
+//    的 2 倍、45° 砖 4 倍、直线砖 1 倍）超过阈值时进行；未超阈值保持
+//    单手连续敲击（低 KPS 段单指连打），不再全程左右交替
 //  - 空片不再切换手；段边界仅在有效键位配置变化时重置手序
+//  - 片内事件数超过单手按键数时，直接取满 maxK 个事件（用满全部按键再换手），
+//    替代旧的 2 的幂细分（旧实现在极高 BPM 下会停在只用 3 键之类的尺寸）
 //  - 新增 BuildTechniqueHitEventsEx 导出（旧 BuildTechniqueHitEvents 保留兼容）
 // ─────────────────────────────────────────────────────────────
 #define TECHNIQUE_SIMULATOR_EXPORTS
@@ -35,10 +46,9 @@ struct PieceInfo {
     double startTime;
     double endTime;
     int    evStart;
-    int    multiplier;
 
-    PieceInfo(int ec, int h, double pl, double st, double et, int es, int mult = 0)
-        : evCount(ec), hand(h), pieceLen(pl), startTime(st), endTime(et), evStart(es), multiplier(mult) {
+    PieceInfo(int ec, int h, double pl, double st, double et, int es)
+        : evCount(ec), hand(h), pieceLen(pl), startTime(st), endTime(et), evStart(es) {
     }
 };
 
@@ -125,17 +135,21 @@ static int CountEventsInRange(const vector<double>& times, int start, double end
 
 // ─────────────────────────────────────────────
 //  分片基础时长
-//  连续映射：不短于“速度阈值”对应的最小交替周期（60/(2*limit)）。
-//  旧实现用八度折叠（rate 刚超过 limit 时片长 2 倍跳变），
-//  会导致铺面 BPM 略微超过阈值时手法突变，此处改为连续钳制。
+//  局部半拍 h = 60/(2*rate)。速率超过阈值时把片长量化到 h 的整数倍
+//  k = round(rate/limit)（至少 1）：换手频率仍受阈值约束，且片长始终
+//  落在谱面节拍网格上。此前的“连续钳制”直接取 60/(2*limit)，一旦
+//  SetSpeed/BPM 事件改变局部速率，片长就与事件网格失配，"距离−间隙"
+//  评分会把变速段切成 3-1-1 之类的碎块（表现为速度事件一开手法就变）。
 // ─────────────────────────────────────────────
 static double GetBasePieceLength(double bpm, double speed, double limit)
 {
     double rate = bpm * speed;
     if (rate < 1e-9) rate = 1e-9;
-    double halfBeat = 60.0 / (2.0 * rate);
-    double minPeriod = (limit > 1e-9) ? (60.0 / (2.0 * limit)) : 0.0;
-    return halfBeat > minPeriod ? halfBeat : minPeriod;
+    double halfBeat = 30.0 / rate;
+    if (limit <= 1e-9) return halfBeat;
+    double k = floor(rate / limit + 0.5);
+    if (k < 1.0) k = 1.0;
+    return halfBeat * k;
 }
 
 // 计算松键时刻偏移量
@@ -241,16 +255,12 @@ HitEvent* BuildTechniqueHitEventsEx(
             lastSegLimit = ec0.bpmLimit;
             lastSegIdx   = segIdx;     // 首次不触发边界重置
         }
-        double baseLen = GetBasePieceLength(bpm, speedMuls ? speedMuls[0] : speed, lastSegLimit);
+        double baseLen = GetBasePieceLength(bpm,
+            speedMuls ? speedMuls[(eventCount > 1) ? 1 : 0] : speed, lastSegLimit);
 
         double nowT = 0.0;
         int    nowD = 0;
         int    hand = (g_config.handPreference == 0) ? -1 : 1; // -1=左主, 1=右主
-        int    mult = 0;
-        long long mCnt[16] = {};
-        long long mCntPre[16] = {};
-        int  canMulti = 0;
-        bool needBack = false;
 
         // 段边界处用于比较“有效键位是否变化”
         const unsigned char* prevLeftKeys = g_config.leftKeys;
@@ -274,7 +284,7 @@ HitEvent* BuildTechniqueHitEventsEx(
             int curSegIdx;
             auto ec = ResolveConfig(evFloor[nowD], &curSegIdx);
 
-            // 段边界：仅当有效键位配置变化时才重置连续状态（手交替·倍乘·回溯）。
+            // 段边界：仅当有效键位配置变化时才重置连续状态（手交替）。
             // 只改 BPM 阈值的分段不应打断手序：历史 bug——配置档里残留的
             // [0,0] 空分段会在第 2 个事件处触发重置，导致起始手连按两次。
             if (curSegIdx != lastSegIdx) {
@@ -283,11 +293,6 @@ HitEvent* BuildTechniqueHitEventsEx(
                     ec.rightKeys != prevRightKeys || ec.rightKeyCount != prevRightKeyCount;
                 if (keysChanged) {
                     hand = (g_config.handPreference == 0) ? -1 : 1;
-                    mult = 0;
-                    memset(mCnt, 0, sizeof(mCnt));
-                    memset(mCntPre, 0, sizeof(mCntPre));
-                    canMulti = 0;
-                    needBack = false;
                 }
                 prevLeftKeys = ec.leftKeys;   prevLeftKeyCount = ec.leftKeyCount;
                 prevRightKeys = ec.rightKeys; prevRightKeyCount = ec.rightKeyCount;
@@ -295,50 +300,61 @@ HitEvent* BuildTechniqueHitEventsEx(
                 lastSegIdx = curSegIdx;
             }
 
-            // 局部速率：逐事件速度倍率来自 scrFloor.speed（SetSpeed/BPM 事件已折算）。
-            // 连续钳制基础片长（见 GetBasePieceLength），避免阈值处手法突变。
-            double localSpeed = speedMuls ? speedMuls[nowD] : speed;
+            // 局部速率：事件 i 的时刻是“进入第 i+1 层”的时间，事件 i→i+1
+            // 的间隔由第 i+1 层的 speed 决定；分片起点的速率取下一事件倍率
+            // （末事件回退当前），否则变速段第一片会沿用旧速率、切分错位。
+            double localSpeed;
+            if (speedMuls) {
+                int si = (nowD + 1 < eventCount) ? nowD + 1 : nowD;
+                localSpeed = speedMuls[si];
+            } else {
+                localSpeed = speed;
+            }
             baseLen = GetBasePieceLength(bpm, localSpeed, lastSegLimit);
+
+            // 慢速段（局部速率未超阈值）：片长不超过到下一事件的间隔，
+            // 下限取阈值半拍。否则低 BPM 下"半拍"可能长达 1 秒，会把
+            // 45° 等更细网格的慢音符也并进同一只手（能用 2 键却用 4 键），
+            // 长按释放时刻也会被拖到整片长度。
+            if (bpm * localSpeed <= lastSegLimit && nowD + 1 < eventCount) {
+                double gap = evTime[nowD + 1] - evTime[nowD];
+                double minPeriod = (lastSegLimit > 1e-9) ? (30.0 / lastSegLimit) : 0.0;
+                double cap = (gap > minPeriod) ? gap : minPeriod;
+                if (baseLen > cap) baseLen = cap;
+            }
 
             // 防止死循环
             if (pieces.size() > (size_t)eventCount * 64) break;
 
-            double pLen = baseLen / pow(2.0, mult);
+            double pLen = baseLen;
             if (pLen < 1e-9) pLen = 1e-9;
+
+            int pieceStartD = nowD;   // 本片起始事件（换手判定用）
 
             int cnt = CountEventsInRange(evTime, nowD, nowT + pLen * 0.995);
             int csH = (hand == 1) ? 1 : 0;
             int maxK = (csH == 0) ? ec.leftKeyCount : ec.rightKeyCount;
-            int mainHand = (g_config.handPreference == 0) ? -1 : 1;
-            bool isOffHand = (hand != mainHand);
 
-            // 按键数超限：提升倍乘
+            // 按键数超限：本片直接取满该手全部按键（maxK 个事件）。
+            // 旧实现按 2 的幂细分片长，片内事件数可能停在 maxK 以下
+            // （例如 5 指只用 3 指），且随速率升高不单调；高密度下应让
+            // 单手滚完所有手指再换手。pLen 对准第 maxK 个事件的切点，
+            // 使下面的评分保持该片长而不是把它缩回更小的片。
             if (cnt > maxK) {
-                if (canMulti == 1 && isOffHand) needBack = true;
-                if (mult < 7) { mult++; mCnt[mult] = 0; continue; }
-                else { cnt = maxK; }
-            }
-
-            // 回溯到上一片（由主手重新处理）
-            if (needBack && !pieces.empty()) {
-                needBack = false;
-                hand = mainHand;
-                auto& prev = pieces.back();
-                nowT = prev.startTime;
-                nowD = prev.evStart;
-                memcpy(mCnt, mCntPre, sizeof(mCnt));
-                mult = prev.multiplier + 1;
-                if (mult > 7) mult = 7;
-                pieces.pop_back();
-                canMulti = 0;
-                continue;
+                cnt = maxK;
+                int cut = nowD + maxK;
+                if (cut < eventCount)
+                    pLen = evTime[cut] - nowT;
             }
 
             // ── 事件边界对齐（距离 + 间隙综合评分）───────────────
             // 在标称片长对应的“事件数 ± 窗口”内选切点：
-            //   score = |切点时长 − 标称片长| − 切点间隙
+            //   score = 切点时长对标的偏离 − 切点间隙
             // 纯“最大间隙”会把手速双押与相邻单音并成三押；
             // 纯“最近距离”会把快双押/和弦从中间切开；加权兼顾两者。
+            // 欠长（换手早于标称片长）代价加倍：宁可把当前手速簇完整
+            // 收进一片，也不要在可合并时提前换手（否则 SetSpeed 提速段
+            // 会被切成 3-1-1 式碎块）。
             // speedChangeTolerance 控制窗口宽度：0=仅邻近（按簇分组），
             // 越大越倾向合并相邻簇成长连打（0.5 → 窗口 ±3）。
             // 切点取“下一事件时刻”（cut-before），下一片直接从该事件起步。
@@ -348,9 +364,8 @@ HitEvent* BuildTechniqueHitEventsEx(
                 // 避免旧实现“每个空片翻一次手”导致的相位漂移。
                 double gapEnd = evTime[nowD];
                 if (gapEnd > nowT + 1e-12) {
-                    pieces.emplace_back(0, csH, gapEnd - nowT, nowT, gapEnd, nowD, mult);
+                    pieces.emplace_back(0, csH, gapEnd - nowT, nowT, gapEnd, nowD);
                     nowT = gapEnd;
-                    canMulti = 1;
                     continue;
                 }
             }
@@ -373,7 +388,8 @@ HitEvent* BuildTechniqueHitEventsEx(
                             ? (evTime[eventCount - 1] - evTime[eventCount - 2]) : pLen;
                         b   = evTime[eventCount - 1] + gap;
                     }
-                    double score = fabs((b - nowT) - pLen) - gap;
+                    double dev = (b - nowT) - pLen;
+                    double score = ((dev < 0.0) ? (-dev * 2.0) : dev) - gap;
                     if (k == lo || score < bestScore) {
                         bestK = k; bestScore = score; bestB = b;
                     }
@@ -383,20 +399,25 @@ HitEvent* BuildTechniqueHitEventsEx(
             }
 
             // 提交时间片
-            memcpy(mCntPre, mCnt, sizeof(mCnt));
-            pieces.emplace_back(cnt, csH, pieceLen, nowT, nowT + pieceLen, nowD, mult);
-
-            // 更新级联倍乘计数器
-            for (int c = mult; c > 0; c--) {
-                mCnt[c] += (long long)pow(2, 16 - (mult - c));
-                mCnt[c] %= (1LL << 18);
-            }
-            while (mult > 0 && mCnt[mult] == 0) mult--;
+            pieces.emplace_back(cnt, csH, pieceLen, nowT, nowT + pieceLen, nowD);
 
             nowD += cnt;
             nowT += pieceLen;
-            hand = -hand;
-            canMulti = 1;
+
+            // 换手策略：按“本片起始音符的实际速率”（音符/分钟）判断是否换手，
+            // 不能直接用谱面 BPM——90° 砖一块 = 半拍，实际音符密度是砖 BPM 的
+            // 2 倍（45° 砖 4 倍、直线砖 1 倍），用事件间隔换算可同时覆盖
+            // SetSpeed 变速与任意角度。未超阈值时保持单手连续敲击（低 KPS
+            // 段即单指连打），超过阈值才左右交替。
+            if (nowD < eventCount) {
+                int j = pieceStartD + 1;
+                while (j < eventCount && evTime[j] <= evTime[pieceStartD] + 1e-9) j++; // 跳过同刻和弦
+                if (j < eventCount) {
+                    double gap = evTime[j] - evTime[pieceStartD];
+                    if (gap > 1e-9 && 60.0 / gap > lastSegLimit)
+                        hand = -hand;
+                }
+            }
 
             // 微误差矫正
             if (nowD < eventCount && fabs(evTime[nowD] - nowT) < pLen * 0.01)
