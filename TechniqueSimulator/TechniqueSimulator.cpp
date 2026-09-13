@@ -12,8 +12,10 @@
 //  - 慢速段（速率未超阈值）片长不超过到下一事件的间隔（下限阈值半拍）：
 //    低 BPM 下更细网格的慢音符（45° 砖等）不再被并进同一只手
 //  - 换手仅在“实际音符速率”（按事件间隔折算，音符/分钟；90° 砖是砖 BPM
-//    的 2 倍、45° 砖 4 倍、直线砖 1 倍）超过阈值时进行；未超阈值保持
-//    单手连续敲击（低 KPS 段单指连打），不再全程左右交替
+//    的 2 倍、45° 砖 4 倍、直线砖 1 倍）超过阈值时进行；未超阈值切回并
+//    保持起始手（主手）连续敲击（低 KPS 段单指连打），不再全程左右交替
+//  - 按压时长以“本片音符跨度 + 最小内部间隔”为上限：片尾跨暂停/长空拍时
+//    不会一直按住；另提供 pressDurationMode=1 切换旧版 1.3.0.30 折叠时长
 //  - 空片不再切换手；段边界仅在有效键位配置变化时重置手序
 //  - 片内事件数超过单手按键数时，直接取满 maxK 个事件（用满全部按键再换手），
 //    替代旧的 2 的幂细分（旧实现在极高 BPM 下会停在只用 3 键之类的尺寸）
@@ -133,6 +135,26 @@ static int CountEventsInRange(const vector<double>& times, int start, double end
     return result - start;
 }
 
+// 事件 idx 处的“实际音符速率”（音符/分钟）：取该事件之前最近的间隔
+// （即它所在的节奏），第一个音符回退到向后间隔；同刻和弦跳过。
+// 无可用间隔返回 0。
+// 用“之前”的间隔可避免把快段最后一个音误判成慢音（它后面紧跟慢段），
+// 90° 砖一块 = 半拍，因此该速率是砖 BPM 的 2 倍（45° 砖 4 倍、直线砖 1 倍）。
+static double LocalNoteRate(const vector<double>& evTime, int idx)
+{
+    int n = (int)evTime.size();
+    int k = idx - 1;
+    while (k >= 0 && evTime[idx] <= evTime[k] + 1e-9) k--;   // 跳过同刻和弦
+    double gap = 0.0;
+    if (k >= 0) gap = evTime[idx] - evTime[k];
+    if (gap <= 1e-9) {                                        // 首音：回退向后间隔
+        int j = idx + 1;
+        while (j < n && evTime[j] <= evTime[idx] + 1e-9) j++;
+        if (j < n) gap = evTime[j] - evTime[idx];
+    }
+    return (gap > 1e-9) ? (60.0 / gap) : 0.0;
+}
+
 // ─────────────────────────────────────────────
 //  分片基础时长
 //  局部半拍 h = 60/(2*rate)。速率超过阈值时把片长量化到 h 的整数倍
@@ -152,7 +174,21 @@ static double GetBasePieceLength(double bpm, double speed, double limit)
     return halfBeat * k;
 }
 
-// 计算松键时刻偏移量
+// 旧版（1.3.0.30）按压时长基准：把速率八度折叠进 (limit/2, limit]，
+// 再取该速率对应的半拍。片长恒在 [60/(2*limit), 60/limit)，因此慢谱
+// 的按键也是一次短按，不会一直按到下一个音符。仅用于 pressDurationMode=1。
+static double GetLegacyPressLength(double bpm, double speed, double limit)
+{
+    double r = bpm * speed;
+    if (r < 1e-9) r = 1e-9;
+    if (limit > 1e-9) {
+        while (r > limit)         r /= 2.0;
+        while (r <= limit / 2.0)  r *= 2.0;
+    }
+    return (r > 1e-9) ? (30.0 / r) : 0.0;
+}
+
+// 计算松键时刻偏移量（按分片结构）
 static double CalculateReleaseTime(double pStart, const PieceInfo& cur, const PieceInfo& next,
     double t, double ratio)
 {
@@ -168,6 +204,26 @@ static double CalculateReleaseTime(double pStart, const PieceInfo& cur, const Pi
         else
             return (next.endTime - t) * ratio / 2.0;
     }
+}
+
+// 该音与前后相邻“不同时刻”音符的较小间隔（同刻和弦跳过后取另一侧，
+// 孤立音回退 fallback）。用于限制按压时长，避免跨暂停/长空拍一直按住。
+static double GetLocalPressInterval(const vector<double>& evTime, int idx, double fallback)
+{
+    int n = (int)evTime.size();
+    double gp = 0.0, gn = 0.0;
+    int k = idx - 1;
+    while (k >= 0 && evTime[idx] <= evTime[k] + 1e-9) k--;
+    if (k >= 0) gp = evTime[idx] - evTime[k];
+    int j = idx + 1;
+    while (j < n && evTime[j] <= evTime[idx] + 1e-9) j++;
+    if (j < n) gn = evTime[j] - evTime[idx];
+
+    double unit;
+    if (gp > 1e-9 && gn > 1e-9) unit = (gp < gn) ? gp : gn;
+    else                        unit = (gp > gn) ? gp : gn;
+    if (unit <= 1e-9) unit = fallback;
+    return unit;
 }
 
 // 修正同键重叠（按下前必须先松开上一次）
@@ -260,7 +316,9 @@ HitEvent* BuildTechniqueHitEventsEx(
 
         double nowT = 0.0;
         int    nowD = 0;
-        int    hand = (g_config.handPreference == 0) ? -1 : 1; // -1=左主, 1=右主
+        const int mainHand = (g_config.handPreference == 0) ? -1 : 1; // -1=左主, 1=右主
+        int    hand = mainHand;
+        bool   anyNote = false;   // 是否已经产生过音符（首音/段首保持起始手）
 
         // 段边界处用于比较“有效键位是否变化”
         const unsigned char* prevLeftKeys = g_config.leftKeys;
@@ -292,12 +350,25 @@ HitEvent* BuildTechniqueHitEventsEx(
                     ec.leftKeys != prevLeftKeys || ec.leftKeyCount != prevLeftKeyCount ||
                     ec.rightKeys != prevRightKeys || ec.rightKeyCount != prevRightKeyCount;
                 if (keysChanged) {
-                    hand = (g_config.handPreference == 0) ? -1 : 1;
+                    hand = mainHand;
+                    anyNote = false;   // 新键位段首片回到起始手
                 }
                 prevLeftKeys = ec.leftKeys;   prevLeftKeyCount = ec.leftKeyCount;
                 prevRightKeys = ec.rightKeys; prevRightKeyCount = ec.rightKeyCount;
                 lastSegLimit = ec.bpmLimit;
                 lastSegIdx = curSegIdx;
+            }
+
+            // 换手策略（在生成当前片之前决定本片用哪只手）：
+            //  - 实际音符速率 > 阈值：与上一片交替（快段左右手轮流）；
+            //  - 未超阈值：回到起始手（主手），慢段尽量用主手，而不是
+            //    沿用快段结束时停在的那只手；
+            //  - 首个音符 / 新键位段首片保持设置的起始手。
+            //  实际速率按事件间隔折算（音符/分钟）：90° 砖是砖 BPM 的 2 倍。
+            if (anyNote) {
+                double curRate = LocalNoteRate(evTime, nowD);
+                if (curRate > 0.0)
+                    hand = (curRate > lastSegLimit) ? (-hand) : mainHand;
             }
 
             // 局部速率：事件 i 的时刻是“进入第 i+1 层”的时间，事件 i→i+1
@@ -328,8 +399,6 @@ HitEvent* BuildTechniqueHitEventsEx(
 
             double pLen = baseLen;
             if (pLen < 1e-9) pLen = 1e-9;
-
-            int pieceStartD = nowD;   // 本片起始事件（换手判定用）
 
             int cnt = CountEventsInRange(evTime, nowD, nowT + pLen * 0.995);
             int csH = (hand == 1) ? 1 : 0;
@@ -400,24 +469,10 @@ HitEvent* BuildTechniqueHitEventsEx(
 
             // 提交时间片
             pieces.emplace_back(cnt, csH, pieceLen, nowT, nowT + pieceLen, nowD);
+            if (cnt > 0) anyNote = true;
 
             nowD += cnt;
             nowT += pieceLen;
-
-            // 换手策略：按“本片起始音符的实际速率”（音符/分钟）判断是否换手，
-            // 不能直接用谱面 BPM——90° 砖一块 = 半拍，实际音符密度是砖 BPM 的
-            // 2 倍（45° 砖 4 倍、直线砖 1 倍），用事件间隔换算可同时覆盖
-            // SetSpeed 变速与任意角度。未超阈值时保持单手连续敲击（低 KPS
-            // 段即单指连打），超过阈值才左右交替。
-            if (nowD < eventCount) {
-                int j = pieceStartD + 1;
-                while (j < eventCount && evTime[j] <= evTime[pieceStartD] + 1e-9) j++; // 跳过同刻和弦
-                if (j < eventCount) {
-                    double gap = evTime[j] - evTime[pieceStartD];
-                    if (gap > 1e-9 && 60.0 / gap > lastSegLimit)
-                        hand = -hand;
-                }
-            }
 
             // 微误差矫正
             if (nowD < eventCount && fabs(evTime[nowD] - nowT) < pLen * 0.01)
@@ -537,7 +592,36 @@ HitEvent* BuildTechniqueHitEventsEx(
                 }
 
                 // ── 计算松键时刻 ──────────────────────────────────
-                double dur = CalculateReleaseTime(pStart, cur, next, t, ratio);
+                // 默认：按分片结构计算，再以“本片自身音符跨度 + 最小内部间隔”
+                // 为上限截断——片尾跨暂停/长空拍时不会把整段时间一直按住。
+                // pressDurationMode=1：旧版（1.3.0.30）风格，基于八度折叠后的半拍。
+                double dur;
+                if (g_config.pressDurationMode == 1) {
+                    double evSpeed = speedMuls ? speedMuls[idx] : speed;
+                    dur = GetLegacyPressLength(bpm, evSpeed, ec.bpmLimit) * ratio;
+                } else {
+                    dur = CalculateReleaseTime(pStart, cur, next, t, ratio);
+                    double span = 0.0, mi = 0.0;
+                    if (cur.evCount > 1) {
+                        int first = cur.evStart, last = cur.evStart + cur.evCount - 1;
+                        span = evTime[last] - evTime[first];
+                        mi = evTime[first + 1] - evTime[first];
+                        for (int q = first + 1; q < last; q++) {
+                            double g = evTime[q + 1] - evTime[q];
+                            if (g < mi) mi = g;
+                        }
+                    } else {
+                        mi = GetLocalPressInterval(evTime, idx, cur.pieceLen);
+                    }
+                    double cap = ratio * (span + mi);
+                    if (dur > cap) dur = cap;
+
+                    // 仿人下限：不低于“阈值折叠基准 × 比例”（约 40~80ms）。
+                    // 极快连打时避免短到看不出按键（实测真人约 50ms）。
+                    double evSpeed = speedMuls ? speedMuls[idx] : speed;
+                    double floorDur = GetLegacyPressLength(bpm, evSpeed, ec.bpmLimit) * ratio;
+                    if (dur < floorDur) dur = floorDur;
+                }
                 double rel = t + dur;
 
                 if (next.hand != cur.hand || next.evCount == 0) {

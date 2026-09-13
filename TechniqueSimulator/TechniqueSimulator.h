@@ -86,6 +86,9 @@ struct TechniqueConfig {
     int               segmentCount;
     // 4 bytes padding
     double speedChangeTolerance;
+    // 按压时长风格：0=跟随音符片长（新），1=旧版 1.3.0.30 折叠片长
+    int    pressDurationMode;
+    // 4 bytes padding
 };
 
 #pragma pack(pop)

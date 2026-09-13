@@ -1232,7 +1232,8 @@ namespace ADOFAIMacro.Macro
                         Main.Settings.TechniqueBpmLimit,
                         handPref,
                         speedChangeTolerance,
-                        segments);
+                        segments,
+                        Main.Settings.TechniqueLegacyPressDuration ? 1 : 0);
 
                     if (TechniqueSimulator.BuildHitEvents(
                             [.. evTime], [.. evPress], [.. evFloor], [.. evSpeed],
@@ -1431,6 +1432,43 @@ namespace ADOFAIMacro.Macro
             }
         }
 
+        // 按分片结构计算松键偏移（与原生 DLL 的 CalculateReleaseTime 一致）
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static double CalculateReleaseTime(double pStart, PieceInfo cur, PieceInfo next, double t, double ratio)
+        {
+            if (next.PieceLen > cur.PieceLen + 5e-6)
+            {
+                return (pStart + cur.PieceLen > cur.EndTime + 5e-6)
+                    ? (next.EndTime - t) * ratio / 2.0
+                    : (pStart + cur.PieceLen * 2.0 - t) * ratio / 2.0;
+            }
+            return (pStart + cur.PieceLen + 5e-6 < cur.EndTime)
+                ? (pStart + cur.PieceLen + next.PieceLen - t) * ratio / 2.0
+                : (next.EndTime - t) * ratio / 2.0;
+        }
+
+        // 新版（默认）按压时长基准：该音与前后相邻“不同时刻”音符的较小间隔。
+        // 用于在片尾跨暂停/长空拍时限制按住时长。同刻和弦跳过后取另一侧，
+        // 孤立音回退片长。
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static double GetLocalPressInterval(List<double> evTime, int idx, double fallback)
+        {
+            int n = evTime.Count;
+            double gp = 0.0, gn = 0.0;
+            int k = idx - 1;
+            while (k >= 0 && evTime[idx] <= evTime[k] + 1e-9) k--;
+            if (k >= 0) gp = evTime[idx] - evTime[k];
+            int j = idx + 1;
+            while (j < n && evTime[j] <= evTime[idx] + 1e-9) j++;
+            if (j < n) gn = evTime[j] - evTime[idx];
+
+            double unit;
+            if (gp > 1e-9 && gn > 1e-9) unit = Math.Min(gp, gn);
+            else                        unit = Math.Max(gp, gn);
+            if (unit <= 1e-9) unit = fallback;
+            return unit;
+        }
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static List<HitEvent> GenerateHitEventsFromPieces(
             List<double> evTime, List<int> evPress, List<int> evFloor,
@@ -1509,20 +1547,32 @@ namespace ADOFAIMacro.Macro
                     if (isHoldHead) { activeHold = true; activeHoldKey = kc; }
                     if (!sim || isHoldHead) continue;
 
-                    // 计算松键时间
-                    double dur;
-                    if (next.PieceLen > cur.PieceLen + 5e-6)
+                    // 计算松键时间：按分片结构计算，再以“本片自身音符跨度 + 最小
+                    // 内部间隔”为上限截断，避免片尾跨暂停/长空拍时一直按住。
+                    double dur = CalculateReleaseTime(pStart, cur, next, t, ratio);
+                    double span = 0.0, mi = 0.0;
+                    if (cur.EvCount > 1)
                     {
-                        dur = (pStart + cur.PieceLen > cur.EndTime + 5e-6)
-                            ? (next.EndTime - t) * ratio / 2.0
-                            : (pStart + cur.PieceLen * 2.0 - t) * ratio / 2.0;
+                        int first = cur.EvStart, last = cur.EvStart + cur.EvCount - 1;
+                        span = evTime[last] - evTime[first];
+                        mi = evTime[first + 1] - evTime[first];
+                        for (int q = first + 1; q < last; q++)
+                        {
+                            double g = evTime[q + 1] - evTime[q];
+                            if (g < mi) mi = g;
+                        }
                     }
                     else
                     {
-                        dur = (pStart + cur.PieceLen + 5e-6 < cur.EndTime)
-                            ? (pStart + cur.PieceLen + next.PieceLen - t) * ratio / 2.0
-                            : (next.EndTime - t) * ratio / 2.0;
+                        mi = GetLocalPressInterval(evTime, idx, cur.PieceLen);
                     }
+                    double cap = ratio * (span + mi);
+                    if (dur > cap) dur = cap;
+
+                    // 仿人下限：不低于“阈值折叠基准 × 比例”（约 40~80ms）
+                    double segLimit = GetSegmentBpmLimit(evFloor[idx]);
+                    double floorDur = ratio * (30.0 / GetAdviceBpm(segLimit));
+                    if (dur < floorDur) dur = floorDur;
 
                     double rel = t + dur;
 

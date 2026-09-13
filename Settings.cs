@@ -395,6 +395,14 @@ namespace ADOFAIMacro
             set => _speedChangeTolerance = Mathf.Clamp(value, 0f, 0.5f);
         }
 
+        // ── 按压时长风格：false=跟随音符片长（新），true=旧版 1.3.0.30 折叠片长 ──
+        private bool _techniqueLegacyPressDuration = false;
+        public bool TechniqueLegacyPressDuration
+        {
+            get => _techniqueLegacyPressDuration;
+            set { if (_techniqueLegacyPressDuration == value) return; _techniqueLegacyPressDuration = value; }
+        }
+
         private (string input, bool focused) _speedChangeToleranceState = (string.Empty, false);
 
         private (string input, bool focused) _techLeftKeysState = (string.Empty, false);
@@ -1250,6 +1258,13 @@ namespace ADOFAIMacro
             GUILayout.EndHorizontal();
             GUILayout.Space(2);
             GUILayout.Label(LocalizationManager.Get("tech.speed_change_tolerance_desc"), tipStyle);
+
+            // ── 按压时长风格 ─────────────────────────────────
+            GUILayout.Space(4);
+            TechniqueLegacyPressDuration = UIUtils.M3Switch(
+                TechniqueLegacyPressDuration,
+                LocalizationManager.Get("tech.legacy_press_duration"));
+            GUILayout.Label(LocalizationManager.Get("tech.legacy_press_duration_desc"), tipStyle);
 
             // ── 变速分段 ─────────────────────────────────────
             DrawTechniqueSegments();
