@@ -52,6 +52,26 @@ static TechniqueConfig g_config;
 // 任何真实音符间隔，不会把正常连打并成一簇。
 static const double kSameMomentEps = 3e-3;
 
+// 多押簇：作者手速多押常见写法是多块 1° 砖 + 999 midspin，相邻 entryTime 相差
+// 0.8~3ms、整簇跨度十几~二十几毫秒（本测试谱是 8 连，跨度 5.6/11.1/22.2ms）。
+// 这类簇在人手上就是一次同押，不能当超高速连打左右手乱拆。
+// 判定：从 idx 起连续事件内部间隔 <= kChordGap 地延伸，得到一段“跑”；
+// 若该跑 >=2 个事件且整段跨度 <= kChordSpan，就是一个多押簇。
+// 对真正的匀速连打（内部间隔都 <= kChordGap、跑会一直延伸到结尾、跨度远超
+// kChordSpan）不会误判为簇。
+static const double kChordGap = 1.2e-2;   // 簇内相邻事件最大间隔（12ms）
+static const double kChordSpan = 3.5e-2;  // 整簇最大时间跨度（35ms）
+
+static int ChordClusterSize(const vector<double>& evTime, int idx)
+{
+    int n = (int)evTime.size();
+    int j = idx;
+    while (j + 1 < n && evTime[j + 1] - evTime[j] <= kChordGap) j++;
+    int size = j - idx + 1;
+    if (size >= 2 && evTime[j] - evTime[idx] <= kChordSpan) return size;
+    return 1;
+}
+
 // 多押均分各片的事件数：p 片交替手（从 firstHand 开始），大小尽量相等
 // （相差≤1），多余的键优先给主手（mainHand）。
 static void ComputeChordSplitSizes(int n, int p, int firstHand, int mainHand, vector<int>& sizes)
@@ -481,23 +501,23 @@ HitEvent* BuildTechniqueHitEventsEx(
             int maxK = (csH == 0) ? ec.leftKeyCount : ec.rightKeyCount;
 
             // ── 多押按键均分 ──────────────────────────────────
-            // 同一“时刻”的事件数超过单手按键数时：开启开关则把这一簇多押
-            // 对半均分到两只手（单数时多的一键给主手），整簇作为一片提交，
-            // 生成阶段再逐事件交替取手/取键；关闭则沿用“主手取满 maxK，
-            // 余数交给另一手”的旧行为。
+            // 同一“时刻”（自适应多押簇：内部间隔小、整簇跨度小）的事件数超过
+            // 单手按键数时：开启开关则把这一簇多押对半均分到两只手（单数时多的
+            // 一键给主手），整簇作为一片提交，生成阶段再逐事件交替取手/取键；
+            // 关闭则沿用“主手取满 maxK，余数交给另一手”的旧行为。
             {
-                int chordN = 0;
-                {
-                    int j = nowD;
-                    while (j < eventCount && evTime[j] <= evTime[nowD] + kSameMomentEps) j++;
-                    chordN = j - nowD;
-                }
+                int chordN = ChordClusterSize(evTime, nowD);
                 if (g_config.multiChordBalance && chordN > maxK) {
                     int capMax = (ec.leftKeyCount > ec.rightKeyCount) ? ec.leftKeyCount : ec.rightKeyCount;
                     if (capMax < 1) capMax = 1;
                     int p = (chordN + capMax - 1) / capMax;   // 需要的片数
                     if (p < 2) p = 2;
-                    double splitLen = gapNext;
+                    // 片长取到“簇结束后的下一个事件”，而不是簇内相邻间隔，
+                    // 否则整簇会只占几毫秒、nowT 与 nowD 失配。
+                    double splitLen = baseLen;
+                    if (nowD + chordN < eventCount)
+                        splitLen = evTime[nowD + chordN] - evTime[nowD];
+                    if (splitLen <= 1e-9) splitLen = gapNext;
                     if (splitLen <= 1e-9) splitLen = baseLen;
                     if (splitLen <= 1e-9) splitLen = 1e-9;
                     pieces.emplace_back(chordN, csH, splitLen, nowT, nowT + splitLen, nowD, true);

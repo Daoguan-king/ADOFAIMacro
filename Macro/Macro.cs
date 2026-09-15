@@ -342,7 +342,15 @@ namespace ADOFAIMacro.Macro
                 step = mean * 0.06f;
                 if (step > 0.8f) step = 0.8f; else if (step < -0.8f) step = -0.8f;
             }
-            _autoOffsetMs -= step;
+            // ⚠️ r150 判定误差符号：errMs>0 = 早、errMs<0 = 迟。
+            // 判定探针复刻 scrHitErrorMeter.AddHit 的 `angleDiff * -57.29578`，
+            // 而游戏 scrMisc.SelectHitMarginByTimeBoundary 里正号才是 Late
+            // （>+Counted→TooLate），两者相差一个负号——因此探针 err<0 表示迟发。
+            // 迟发必须【减小】触发偏移把按键提前，故这里为 `+= step`。
+            // 旧实现 `-= step` 方向相反：密集多押（16 押）时按键爆发式迟发使
+            // err 持续为负，偏移被一路推到 +60ms 钳制位（见 Player.log 的
+            // Macro-Cali 全程为正且 36 次饱和），整张谱系统性迟发→打不过。
+            _autoOffsetMs += step;
             if (_autoOffsetMs > 60f) _autoOffsetMs = 60f;
             else if (_autoOffsetMs < -60f) _autoOffsetMs = -60f;
 
