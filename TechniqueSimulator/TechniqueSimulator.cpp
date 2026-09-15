@@ -25,6 +25,10 @@
 //  - 片内事件数超过单手按键数时，直接取满 maxK 个事件（用满全部按键再换手），
 //    替代旧的 2 的幂细分（旧实现在极高 BPM 下会停在只用 3 键之类的尺寸）
 //  - 新增 BuildTechniqueHitEventsEx 导出（旧 BuildTechniqueHitEvents 保留兼容）
+//  - 新增“多押按键均分”（multiChordBalance）：同一时刻事件数超过单手按键数时，
+//    把该簇对半均分到两只手（单数时多的一键给主手，如 6押→R3 L3、7押→R4 L3、
+//    8押→R4 L4）；关闭时沿用“主手取满 maxK、余数给另一手”（如 6押→R5 L1）。
+//    同刻判定容差 kSameMomentEps 放宽到 3ms 以覆盖多押砖的取整抖动。
 // ─────────────────────────────────────────────────────────────
 #define TECHNIQUE_SIMULATOR_EXPORTS
 #include "TechniqueSimulator.h"
@@ -43,9 +47,27 @@ using namespace std;
 // ─────────────────────────────────────────────
 static TechniqueConfig g_config;
 
-// “同一时刻”判定容差：游戏里双押/和弦各砖的 entryTime 可能相差几十微秒
-// （角度取整误差），手法上应视为同刻。1ms 远小于任何真实音符间隔。
-static const double kSameMomentEps = 1e-3;
+// “同一时刻”判定容差：游戏里双押/和弦（含多押）各砖的 entryTime 可能
+// 相差几十微秒~约 2 毫秒（角度取整误差），手法上应视为同刻。3ms 仍远小于
+// 任何真实音符间隔，不会把正常连打并成一簇。
+static const double kSameMomentEps = 3e-3;
+
+// 多押均分各片的事件数：p 片交替手（从 firstHand 开始），大小尽量相等
+// （相差≤1），多余的键优先给主手（mainHand）。
+static void ComputeChordSplitSizes(int n, int p, int firstHand, int mainHand, vector<int>& sizes)
+{
+    sizes.assign((size_t)(p > 0 ? p : 1), 0);
+    int base = n / p, rem = n % p;
+    for (int i = 0; i < p; i++) sizes[i] = base;
+    for (int i = 0; i < p && rem > 0; i++) {
+        int h = (i % 2 == 0) ? firstHand : 1 - firstHand;
+        if (h == mainHand) { sizes[i]++; rem--; }
+    }
+    for (int i = 0; i < p && rem > 0; i++) {
+        int h = (i % 2 == 0) ? firstHand : 1 - firstHand;
+        if (h != mainHand) { sizes[i]++; rem--; }
+    }
+}
 
 // ─────────────────────────────────────────────
 //  时间片信息
@@ -57,9 +79,10 @@ struct PieceInfo {
     double startTime;
     double endTime;
     int    evStart;
+    bool   splitEven;   // 多押按键均分：片内事件按手交替分配
 
-    PieceInfo(int ec, int h, double pl, double st, double et, int es)
-        : evCount(ec), hand(h), pieceLen(pl), startTime(st), endTime(et), evStart(es) {
+    PieceInfo(int ec, int h, double pl, double st, double et, int es, bool se = false)
+        : evCount(ec), hand(h), pieceLen(pl), startTime(st), endTime(et), evStart(es), splitEven(se) {
     }
 };
 
@@ -215,17 +238,18 @@ static double CalculateReleaseTime(double pStart, const PieceInfo& cur, const Pi
     }
 }
 
-// 该音与前后相邻“不同时刻”音符的较小间隔（同刻和弦跳过后取另一侧，
-// 孤立音回退 fallback）。用于限制按压时长，避免跨暂停/长空拍一直按住。
+// 该音与前后相邻“不同时刻”音符的较小间隔（同刻双押/和弦按 kSameMomentEps
+// 跳过后取另一侧，孤立音回退 fallback）。用于限制按压时长，避免跨暂停/长空拍
+// 一直按住。
 static double GetLocalPressInterval(const vector<double>& evTime, int idx, double fallback)
 {
     int n = (int)evTime.size();
     double gp = 0.0, gn = 0.0;
     int k = idx - 1;
-    while (k >= 0 && evTime[idx] <= evTime[k] + 1e-9) k--;
+    while (k >= 0 && evTime[idx] <= evTime[k] + kSameMomentEps) k--;
     if (k >= 0) gp = evTime[idx] - evTime[k];
     int j = idx + 1;
-    while (j < n && evTime[j] <= evTime[idx] + 1e-9) j++;
+    while (j < n && evTime[j] <= evTime[idx] + kSameMomentEps) j++;
     if (j < n) gn = evTime[j] - evTime[idx];
 
     double unit;
@@ -456,6 +480,38 @@ HitEvent* BuildTechniqueHitEventsEx(
             int csH = (hand == 1) ? 1 : 0;
             int maxK = (csH == 0) ? ec.leftKeyCount : ec.rightKeyCount;
 
+            // ── 多押按键均分 ──────────────────────────────────
+            // 同一“时刻”的事件数超过单手按键数时：开启开关则把这一簇多押
+            // 对半均分到两只手（单数时多的一键给主手），整簇作为一片提交，
+            // 生成阶段再逐事件交替取手/取键；关闭则沿用“主手取满 maxK，
+            // 余数交给另一手”的旧行为。
+            {
+                int chordN = 0;
+                {
+                    int j = nowD;
+                    while (j < eventCount && evTime[j] <= evTime[nowD] + kSameMomentEps) j++;
+                    chordN = j - nowD;
+                }
+                if (g_config.multiChordBalance && chordN > maxK) {
+                    int capMax = (ec.leftKeyCount > ec.rightKeyCount) ? ec.leftKeyCount : ec.rightKeyCount;
+                    if (capMax < 1) capMax = 1;
+                    int p = (chordN + capMax - 1) / capMax;   // 需要的片数
+                    if (p < 2) p = 2;
+                    double splitLen = gapNext;
+                    if (splitLen <= 1e-9) splitLen = baseLen;
+                    if (splitLen <= 1e-9) splitLen = 1e-9;
+                    pieces.emplace_back(chordN, csH, splitLen, nowT, nowT + splitLen, nowD, true);
+                    anyNote = true;
+                    // 交替分配后停在另一只手：让下一次换手相位保持一致
+                    if (p % 2 == 0) hand = -hand;
+                    nowD += chordN;
+                    nowT += splitLen;
+                    if (nowD < eventCount && fabs(evTime[nowD] - nowT) < splitLen * 0.01)
+                        nowT = evTime[nowD];
+                    continue;
+                }
+            }
+
             // 按键数超限：本片直接取满该手全部按键（maxK 个事件）。
             // 旧实现按 2 的幂细分片长，片内事件数可能停在 maxK 以下
             // （例如 5 指只用 3 指），且随速率升高不单调；高密度下应让
@@ -551,6 +607,19 @@ HitEvent* BuildTechniqueHitEventsEx(
             auto& next = pieces[pcnt + 1];
             double pStart = (pcnt > 0) ? pieces[pcnt - 1].endTime : 0.0;
 
+            // 多押均分片：预先算好各手分到的事件数（片内事件按手交替）
+            vector<int> splitSizes;
+            if (cur.splitEven && cur.evCount > 0) {
+                int fFloor = evFloor[(size_t)min(cur.evStart, (int)evFloor.size() - 1)];
+                int dummy;
+                auto ecSplit = ResolveConfig(fFloor, &dummy);
+                int lk = ecSplit.leftKeyCount, rk = ecSplit.rightKeyCount;
+                int capMax = (lk > rk) ? lk : rk; if (capMax < 1) capMax = 1;
+                int p = (cur.evCount + capMax - 1) / capMax; if (p < 2) p = 2;
+                int mainH = (g_config.handPreference == 0) ? 0 : 1;
+                ComputeChordSplitSizes(cur.evCount, p, cur.hand, mainH, splitSizes);
+            }
+
             for (int i = 0; i < cur.evCount; i++) {
                 int    idx = cur.evStart + i;
                 int    press = evPress[idx];
@@ -593,22 +662,39 @@ HitEvent* BuildTechniqueHitEventsEx(
                     lastSegIdxEvent = curSegIdx;
                 }
 
-                const unsigned char* keys = (cur.hand == 0) ? ec.leftKeys : ec.rightKeys;
-                int                  keyCount = (cur.hand == 0) ? ec.leftKeyCount : ec.rightKeyCount;
-                int** orders = (cur.hand == 0) ? ec.leftKeyOrders : ec.rightKeyOrders;
-                int* orderLens = (cur.hand == 0) ? ec.leftOrderLengths : ec.rightOrderLengths;
-                int                  orderCounts = (cur.hand == 0) ? ec.leftOrderCounts : ec.rightOrderCounts;
-                const double* pressTimes = (cur.hand == 0) ? ec.leftPressTimes : ec.rightPressTimes;
+                // 多押均分：片内事件按预先分配结果逐事件换手；否则整片同一只手。
+                int eh = cur.hand;
+                int ei = i;
+                int groupSize = cur.evCount;
+                if (cur.splitEven) {
+                    int acc = 0;
+                    for (int g = 0; g < (int)splitSizes.size(); g++) {
+                        if (i < acc + splitSizes[g]) {
+                            eh = (g % 2 == 0) ? cur.hand : 1 - cur.hand;
+                            ei = i - acc;
+                            groupSize = splitSizes[g];
+                            break;
+                        }
+                        acc += splitSizes[g];
+                    }
+                }
+
+                const unsigned char* keys = (eh == 0) ? ec.leftKeys : ec.rightKeys;
+                int                  keyCount = (eh == 0) ? ec.leftKeyCount : ec.rightKeyCount;
+                int** orders = (eh == 0) ? ec.leftKeyOrders : ec.rightKeyOrders;
+                int* orderLens = (eh == 0) ? ec.leftOrderLengths : ec.rightOrderLengths;
+                int                  orderCounts = (eh == 0) ? ec.leftOrderCounts : ec.rightOrderCounts;
+                const double* pressTimes = (eh == 0) ? ec.leftPressTimes : ec.rightPressTimes;
 
                 // 保护：若 keyCount 为 0，跳过
                 if (!keys || keyCount <= 0) continue;
 
-                int oi = min(cur.evCount - 1, keyCount - 1);
+                int oi = min(groupSize - 1, keyCount - 1);
                 int ki;
-                if (oi < orderCounts && orders && orders[oi] && i < orderLens[oi])
-                    ki = orders[oi][i];
+                if (oi < orderCounts && orders && orders[oi] && ei < orderLens[oi])
+                    ki = orders[oi][ei];
                 else
-                    ki = i % keyCount;
+                    ki = ei % keyCount;
                 ki = max(0, min(ki, keyCount - 1));
 
                 unsigned char kc = keys[ki];
@@ -656,11 +742,16 @@ HitEvent* BuildTechniqueHitEventsEx(
                     if (cur.evCount > 1) {
                         int first = cur.evStart, last = cur.evStart + cur.evCount - 1;
                         span = evTime[last] - evTime[first];
-                        mi = evTime[first + 1] - evTime[first];
-                        for (int q = first + 1; q < last; q++) {
+                        // 取“有意义”的内部间隔，跳过同刻双押/和弦的 ~0 间隙；
+                        // 纯和弦（整片同刻）没有内部间隔，回退到与前后相邻音的
+                        // 间隔。否则 cap 会被 ~0 的内部间隙压成 0，和弦音只能退
+                        // 到仿人下限，和同速率的单音按压时长不一致。
+                        bool found = false;
+                        for (int q = first; q < last; q++) {
                             double g = evTime[q + 1] - evTime[q];
-                            if (g < mi) mi = g;
+                            if (g > kSameMomentEps && (!found || g < mi)) { mi = g; found = true; }
                         }
+                        if (!found) mi = GetLocalPressInterval(evTime, first, cur.pieceLen);
                     } else {
                         mi = GetLocalPressInterval(evTime, idx, cur.pieceLen);
                     }

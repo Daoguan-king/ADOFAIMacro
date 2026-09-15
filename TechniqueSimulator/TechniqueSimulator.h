@@ -88,7 +88,8 @@ struct TechniqueConfig {
     double speedChangeTolerance;
     // 按压时长风格：0=跟随音符片长（新），1=旧版 1.3.0.30 折叠片长
     int    pressDurationMode;
-    // 4 bytes padding
+    // 多押按键均分：0=关（主手取满 maxK 后余数给另一手），1=开（对半均分到两手）
+    int    multiChordBalance;
 };
 
 #pragma pack(pop)

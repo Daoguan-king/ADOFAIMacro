@@ -1233,7 +1233,8 @@ namespace ADOFAIMacro.Macro
                         handPref,
                         speedChangeTolerance,
                         segments,
-                        Main.Settings.TechniqueLegacyPressDuration ? 1 : 0);
+                        Main.Settings.TechniqueLegacyPressDuration ? 1 : 0,
+                        Main.Settings.TechniqueMultiChordBalance ? 1 : 0);
 
                     if (TechniqueSimulator.BuildHitEvents(
                             [.. evTime], [.. evPress], [.. evFloor], [.. evSpeed],

@@ -403,6 +403,14 @@ namespace ADOFAIMacro
             set { if (_techniqueLegacyPressDuration == value) return; _techniqueLegacyPressDuration = value; }
         }
 
+        // ── 多押按键均分：false=主手取满按键数后余数给另一手；true=对半均分到两手 ──
+        private bool _techniqueMultiChordBalance = false;
+        public bool TechniqueMultiChordBalance
+        {
+            get => _techniqueMultiChordBalance;
+            set { if (_techniqueMultiChordBalance == value) return; _techniqueMultiChordBalance = value; }
+        }
+
         private (string input, bool focused) _speedChangeToleranceState = (string.Empty, false);
 
         private (string input, bool focused) _techLeftKeysState = (string.Empty, false);
@@ -1265,6 +1273,13 @@ namespace ADOFAIMacro
                 TechniqueLegacyPressDuration,
                 LocalizationManager.Get("tech.legacy_press_duration"));
             GUILayout.Label(LocalizationManager.Get("tech.legacy_press_duration_desc"), tipStyle);
+
+            // ── 多押按键均分 ─────────────────────────────────
+            GUILayout.Space(4);
+            TechniqueMultiChordBalance = UIUtils.M3Switch(
+                TechniqueMultiChordBalance,
+                LocalizationManager.Get("tech.multi_chord_balance"));
+            GUILayout.Label(LocalizationManager.Get("tech.multi_chord_balance_desc"), tipStyle);
 
             // ── 变速分段 ─────────────────────────────────────
             DrawTechniqueSegments();

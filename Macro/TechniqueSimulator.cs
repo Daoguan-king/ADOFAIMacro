@@ -40,6 +40,7 @@ namespace ADOFAIMacro.Macro
         private static int _cachedHandPreference;
         private static double _cachedSpeedChangeTolerance;
         private static int _cachedPressDurationMode;
+        private static int _cachedMultiChordBalance;
         private static Settings.TechniqueSegment[]? _cachedSegments;
 
         // ─────────────────────────────────────────────
@@ -124,7 +125,8 @@ namespace ADOFAIMacro.Macro
             public double SpeedChangeTolerance;
             // 按压时长风格：0=跟随音符片长（新），1=旧版 1.3.0.30 折叠片长
             public int PressDurationMode;
-            // 4 bytes padding
+            // 多押按键均分：0=关，1=开
+            public int MultiChordBalance;
         }
 
         // ─────────────────────────────────────────────
@@ -181,7 +183,8 @@ namespace ADOFAIMacro.Macro
             int handPreference,
             double speedChangeTolerance,
             Settings.TechniqueSegment[] segments,
-            int pressDurationMode = 0)
+            int pressDurationMode = 0,
+            int multiChordBalance = 0)
         {
             _cachedLeftKeys = leftKeys;
             _cachedRightKeys = rightKeys;
@@ -194,6 +197,7 @@ namespace ADOFAIMacro.Macro
             _cachedSpeedChangeTolerance = speedChangeTolerance;
             _cachedSegments = segments;
             _cachedPressDurationMode = pressDurationMode;
+            _cachedMultiChordBalance = multiChordBalance;
         }
 
         /// <summary>加载 TechniqueSimulator.dll</summary>
@@ -378,7 +382,8 @@ namespace ADOFAIMacro.Macro
                 HandPreference = _cachedHandPreference,
                 SegmentCount = _cachedSegments?.Length ?? 0,
                 SpeedChangeTolerance = _cachedSpeedChangeTolerance,
-                PressDurationMode = _cachedPressDurationMode
+                PressDurationMode = _cachedPressDurationMode,
+                MultiChordBalance = _cachedMultiChordBalance
             };
 
             try
