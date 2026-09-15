@@ -4,6 +4,11 @@
 //  - 分片时长量化到局部半拍：超过阈值时取 h·round(rate/limit)，
 //    既避免八度折叠在阈值处的 2 倍跳变，又保持与谱面节拍网格对齐
 //    （修复 SetSpeed 提速后片长失配、被切成 3-1-1 碎块的问题）
+//  - 分片基础时长改为跟随“实际音符间隔”gapNext × round(音符速率/(2·阈值))：
+//    非 90° 砖 / SetSpeed 组合下局部半拍的整数倍与实际音符间隔不整除，
+//    量化片长会跨过下一个音符，把单音与紧跟的双押/和弦并到同一只手，
+//    造成换手相位漂移（雪花谱由 R2 L1 R1 L3… 恢复为稳定的 R2 L1 R1 L1）；
+//    对 90° 砖（间隔=局部半拍）与旧公式完全一致，不影响常规谱面
 //  - 切点改为“距标称片长距离（欠长加倍）− 事件间隙”综合评分，
 //    吸附到事件边界：不再把手速双押/和弦拆到两只手，也不会把
 //    可合并的连打簇提前换手（旧实现偶发 3-1-1）
@@ -37,6 +42,10 @@ using namespace std;
 //  全局配置
 // ─────────────────────────────────────────────
 static TechniqueConfig g_config;
+
+// “同一时刻”判定容差：游戏里双押/和弦各砖的 entryTime 可能相差几十微秒
+// （角度取整误差），手法上应视为同刻。1ms 远小于任何真实音符间隔。
+static const double kSameMomentEps = 1e-3;
 
 // ─────────────────────────────────────────────
 //  时间片信息
@@ -226,6 +235,35 @@ static double GetLocalPressInterval(const vector<double>& evTime, int idx, doubl
     return unit;
 }
 
+// 按“实际音符间隔”计算折叠按压基准（仿人可见的最短按压，约半拍），
+// 与 GetLegacyPressLength 的区别是：速率由真实音符间隔 60/gap 折算，而不是
+// 局部地板 BPM(bpm*speed)。匀速谱面（各音符间隔相同、但 SetSpeed 让局部
+// speed 不同）因此得到一致的按压时长；同刻双押/和弦也共享同一基准，不会
+// 出现同一双押里一个键按 45ms、另一个按 63ms 的情况。
+static double GetNoteFoldedPressLength(const vector<double>& evTime, int idx, double limit)
+{
+    int n = (int)evTime.size();
+    double gp = 0.0, gn = 0.0;
+    int k = idx - 1;
+    while (k >= 0 && evTime[idx] <= evTime[k] + kSameMomentEps) k--;
+    if (k >= 0) gp = evTime[idx] - evTime[k];
+    int j = idx + 1;
+    while (j < n && evTime[j] <= evTime[idx] + kSameMomentEps) j++;
+    if (j < n) gn = evTime[j] - evTime[idx];
+
+    double unit;
+    if (gp > 1e-9 && gn > 1e-9) unit = (gp < gn) ? gp : gn;
+    else                        unit = (gp > gn) ? gp : gn;
+
+    double r = (unit > 1e-9) ? (60.0 / unit) : 0.0;
+    if (r < 1e-9) r = 1e-9;
+    if (limit > 1e-9) {
+        while (r > limit)         r /= 2.0;
+        while (r <= limit / 2.0)  r *= 2.0;
+    }
+    return (r > 1e-9) ? (30.0 / r) : 0.0;
+}
+
 // 修正同键重叠（按下前必须先松开上一次）
 static void FixSameKeyOverlaps(vector<HitEvent>& events)
 {
@@ -371,9 +409,7 @@ HitEvent* BuildTechniqueHitEventsEx(
                     hand = (curRate > lastSegLimit) ? (-hand) : mainHand;
             }
 
-            // 局部速率：事件 i 的时刻是“进入第 i+1 层”的时间，事件 i→i+1
-            // 的间隔由第 i+1 层的 speed 决定；分片起点的速率取下一事件倍率
-            // （末事件回退当前），否则变速段第一片会沿用旧速率、切分错位。
+            // 局部速度（仅用于异常回退；按压时长在生成阶段按 idx 重新取）
             double localSpeed;
             if (speedMuls) {
                 int si = (nowD + 1 < eventCount) ? nowD + 1 : nowD;
@@ -381,17 +417,33 @@ HitEvent* BuildTechniqueHitEventsEx(
             } else {
                 localSpeed = speed;
             }
-            baseLen = GetBasePieceLength(bpm, localSpeed, lastSegLimit);
 
-            // 慢速段（局部速率未超阈值）：片长不超过到下一事件的间隔，
-            // 下限取阈值半拍。否则低 BPM 下"半拍"可能长达 1 秒，会把
-            // 45° 等更细网格的慢音符也并进同一只手（能用 2 键却用 4 键），
-            // 长按释放时刻也会被拖到整片长度。
-            if (bpm * localSpeed <= lastSegLimit && nowD + 1 < eventCount) {
-                double gap = evTime[nowD + 1] - evTime[nowD];
-                double minPeriod = (lastSegLimit > 1e-9) ? (30.0 / lastSegLimit) : 0.0;
-                double cap = (gap > minPeriod) ? gap : minPeriod;
-                if (baseLen > cap) baseLen = cap;
+            // 基础片长跟随“实际音符间隔” gapNext，而不是把 floor 半拍量化：
+            // 事件网格才是决定换手相位的网格。非 90° 砖 / SetSpeed 组合下，
+            // 局部半拍的整数倍与实际音符间隔不整除，量化片长（如 4×半拍=
+            // 86ms）会跨过下一个音符（79ms），把单音与紧跟的双押/和弦并到
+            // 同一只手，导致换手相位漂移——雪花谱表现为 R2 L1 R1 L3… 而
+            // 不是稳定的 R2 L1 R1 L1。
+            // 片长 = gapNext × k，k = round(音符速率/(2·阈值))：对 90° 砖
+            // （音符间隔 = 局部半拍）与旧公式完全一致，不影响常规谱面。
+            double gapNext = 0.0;
+            {
+                int j = nowD + 1;
+                while (j < eventCount && evTime[j] <= evTime[nowD] + kSameMomentEps) j++;
+                if (j < eventCount) gapNext = evTime[j] - evTime[nowD];
+                if (gapNext <= 1e-9) {   // 末音符：回退到前一个间隔
+                    int k2 = nowD - 1;
+                    while (k2 >= 0 && evTime[nowD] <= evTime[k2] + kSameMomentEps) k2--;
+                    if (k2 >= 0) gapNext = evTime[nowD] - evTime[k2];
+                }
+            }
+            if (gapNext > 1e-9 && lastSegLimit > 1e-9) {
+                double noteRateLen = 60.0 / gapNext;
+                double kk = floor(noteRateLen / (2.0 * lastSegLimit) + 0.5);
+                if (kk < 1.0) kk = 1.0;
+                baseLen = gapNext * kk;
+            } else {
+                baseLen = GetBasePieceLength(bpm, localSpeed, lastSegLimit);
             }
 
             // 防止死循环
@@ -597,8 +649,7 @@ HitEvent* BuildTechniqueHitEventsEx(
                 // pressDurationMode=1：旧版（1.3.0.30）风格，基于八度折叠后的半拍。
                 double dur;
                 if (g_config.pressDurationMode == 1) {
-                    double evSpeed = speedMuls ? speedMuls[idx] : speed;
-                    dur = GetLegacyPressLength(bpm, evSpeed, ec.bpmLimit) * ratio;
+                    dur = GetNoteFoldedPressLength(evTime, idx, ec.bpmLimit) * ratio;
                 } else {
                     dur = CalculateReleaseTime(pStart, cur, next, t, ratio);
                     double span = 0.0, mi = 0.0;
@@ -616,10 +667,11 @@ HitEvent* BuildTechniqueHitEventsEx(
                     double cap = ratio * (span + mi);
                     if (dur > cap) dur = cap;
 
-                    // 仿人下限：不低于“阈值折叠基准 × 比例”（约 40~80ms）。
+                    // 仿人下限：不低于“实际音符间隔折叠基准 × 比例”（约 40~80ms）。
                     // 极快连打时避免短到看不出按键（实测真人约 50ms）。
-                    double evSpeed = speedMuls ? speedMuls[idx] : speed;
-                    double floorDur = GetLegacyPressLength(bpm, evSpeed, ec.bpmLimit) * ratio;
+                    // 注意：用实际音符间隔而不是局部地板 BPM，保证匀速谱面
+                    // （含双押/和弦）按压时长一致，不随 SetSpeed 忽长忽短。
+                    double floorDur = GetNoteFoldedPressLength(evTime, idx, ec.bpmLimit) * ratio;
                     if (dur < floorDur) dur = floorDur;
                 }
                 double rel = t + dur;
